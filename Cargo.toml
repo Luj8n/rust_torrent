@@ -1,0 +1,24 @@
+[package]
+name = "rust_torrent"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[profile.release]
+lto = true
+codegen-units = 1
+# panic = "abort"
+# debug = true
+
+
+[dependencies]
+tokio = { version = "1.18.1", features = ["full"] }
+sha1 = "0.10.1"
+# bytes = "1.1.0"
+anyhow = "1.0.57"
+bip_bencode = "0.4.4"
+torrent_search = { path = "libs/torrent-search-rs" }
+rand = "0.8.5"
+reqwest = "0.11.10"
+urlencoding = "2.1.0"
