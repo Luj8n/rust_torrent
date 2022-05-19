@@ -1,0 +1,17 @@
+[package]
+name = "torrent_search"
+version = "0.3.3"
+authors = ["William Batista <bootlegbilly@protonmail.ch>"]
+license = "MIT"
+description = "An unofficial torrent searching library in Rust"
+homepage = "https://github.com/billyb2/torrent-search-rs"
+repository = "https://github.com/billyb2/torrent-search-rs"
+readme = "README.md"
+categories = ["web-programming", "parsing"]
+keywords = ["torrent", "search", "l337x"]
+edition = "2018"
+
+[dependencies]
+regex = "1"
+unicode-segmentation = "1"
+reqwest = "0.11"
