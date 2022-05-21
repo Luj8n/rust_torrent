@@ -70,7 +70,7 @@ impl Torrent {
     event: Option<Event>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
-    let protocol = self.metainfo.announce.split(":").nth(0);
+    let protocol = self.metainfo.announce.split(':').next();
 
     match protocol {
       Some("https" | "http") => self.request_tracker_http(event, tracker_id).await,
@@ -109,7 +109,7 @@ impl Torrent {
     }
 
     if let Some(tracker_id) = tracker_id {
-      builder = builder.query(&[("trackerid", tracker_id.to_string())]);
+      builder = builder.query(&[("trackerid", tracker_id)]);
     }
 
     let url = builder.build().unwrap().url().to_string()
@@ -126,59 +126,53 @@ impl Torrent {
     let bencode =
       BencodeRef::decode(&response, BDecodeOpt::default()).map_err(|e| anyhow!(e.to_string()))?;
 
-    let root_dict = bencode.dict().ok_or(anyhow!("Couldn't make dict"))?;
+    let root_dict = bencode
+      .dict()
+      .ok_or_else(|| anyhow!("Couldn't make dict"))?;
 
     if let Some(failure_reason) = root_dict
       .lookup(b"failure reason")
-      .map(|x| x.str().map(|y| y.to_owned()))
-      .flatten()
+      .and_then(|x| x.str().map(|y| y.to_owned()))
     {
       return Err(anyhow!(failure_reason));
     }
 
     let warning_message = root_dict
       .lookup(b"warning message")
-      .map(|x| x.str().map(|y| y.to_owned()))
-      .flatten();
+      .and_then(|x| x.str().map(|y| y.to_owned()));
 
     let interval = root_dict
       .lookup(b"interval")
-      .map(|x| x.int().map(|y| y.try_into().ok()))
+      .and_then(|x| x.int().map(|y| y.try_into().ok()))
       .flatten()
-      .flatten()
-      .ok_or(anyhow!("Interval missing"))?;
+      .ok_or_else(|| anyhow!("Interval missing"))?;
 
     let min_interval = root_dict
       .lookup(b"min interval")
-      .map(|x| x.int().map(|y| y.try_into().ok()))
-      .flatten()
+      .and_then(|x| x.int().map(|y| y.try_into().ok()))
       .flatten();
 
     let tracker_id = root_dict
       .lookup(b"tracker id")
-      .map(|x| x.str().map(|y| y.to_owned()))
-      .flatten();
-    // .ok_or(anyhow!("Tracker id missing"))?;
+      .and_then(|x| x.str().map(|y| y.to_owned()));
+    // .ok_or_else(|| anyhow!("Tracker id missing"))?;
 
     let complete = root_dict
       .lookup(b"complete")
-      .map(|x| x.int().map(|y| y.try_into().ok()))
+      .and_then(|x| x.int().map(|y| y.try_into().ok()))
       .flatten()
-      .flatten()
-      .ok_or(anyhow!("Complete missing"))?;
+      .ok_or_else(|| anyhow!("Complete missing"))?;
 
     let incomplete = root_dict
       .lookup(b"incomplete")
-      .map(|x| x.int().map(|y| y.try_into().ok()))
+      .and_then(|x| x.int().map(|y| y.try_into().ok()))
       .flatten()
-      .flatten()
-      .ok_or(anyhow!("Incomplete missing"))?;
+      .ok_or_else(|| anyhow!("Complete missing"))?;
 
     let peers_bytes = root_dict
       .lookup(b"peers")
-      .map(|x| x.bytes())
-      .flatten()
-      .ok_or(anyhow!("Peers missing"))?;
+      .and_then(|x| x.bytes())
+      .ok_or_else(|| anyhow!("Incomplete missing"))?;
 
     let peers = peers_bytes
       .array_chunks::<6>()

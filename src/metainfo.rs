@@ -40,13 +40,12 @@ impl MetaInfo {
   }
 
   fn from_bencode(bencode: BencodeRef) -> Result<Self> {
-    let root_dict = bencode.dict().ok_or(anyhow!("Bad metainfo file"))?;
+    let root_dict = bencode.dict().ok_or_else(|| anyhow!("Bad metainfo file"))?;
 
     let announce = root_dict
       .lookup(b"announce")
-      .map(|x| x.str().map(|y| y.to_owned()))
-      .flatten()
-      .ok_or(anyhow!("Announce missing"))?;
+      .and_then(|x| x.str().map(|y| y.to_owned()))
+      .ok_or_else(|| anyhow!("Announce missing"))?;
 
     // let announce_list = root_dict
     //   .lookup(b"announce-list")
@@ -62,41 +61,35 @@ impl MetaInfo {
 
     let creation_date = root_dict
       .lookup(b"creation date")
-      .map(|x| x.int().map(|y| y.try_into().ok()))
-      .flatten()
+      .and_then(|x| x.int().map(|y| y.try_into().ok()))
       .flatten();
 
     let comment = root_dict
       .lookup(b"comment")
-      .map(|x| x.str().map(|y| y.to_owned()))
-      .flatten();
+      .and_then(|x| x.str().map(|y| y.to_owned()));
 
     let created_by = root_dict
       .lookup(b"created by")
-      .map(|x| x.str().map(|y| y.to_owned()))
-      .flatten();
+      .and_then(|x| x.str().map(|y| y.to_owned()));
 
     // let encoding = root_dict
     //   .lookup(b"encoding")
-    //   .map(|x| x.str().map(|y| y.to_owned()))
-    //   .flatten();
+    //   .and_then(|x| x.str().map(|y| y.to_owned()));
 
     let info_dict = root_dict
       .lookup(b"info")
-      .map(|x| x.dict())
-      .flatten()
-      .ok_or(anyhow!("Info missing"))?;
+      .and_then(|x| x.dict())
+      .ok_or_else(|| anyhow!("Info missing"))?;
 
     let piece_length = info_dict
       .lookup(b"piece length")
-      .map(|x| x.int().map(|y| y.try_into().ok()))
+      .and_then(|x| x.int().map(|y| y.try_into().ok()))
       .flatten()
-      .flatten()
-      .ok_or(anyhow!("Piece length missing or not a positive integer"))?;
+      .ok_or_else(|| anyhow!("Piece length missing or not a positive integer"))?;
 
     let pieces = info_dict
       .lookup(b"pieces")
-      .map(|x| {
+      .and_then(|x| {
         x.bytes().map(|bytes| {
           // TODO: find a way to clean this up a bit
           let mut pieces: Vec<[u8; 20]> = vec![];
@@ -108,8 +101,7 @@ impl MetaInfo {
           pieces
         })
       })
-      .flatten()
-      .ok_or(anyhow!("Pieces missing"))?;
+      .ok_or_else(|| anyhow!("Pieces missing"))?;
 
     // let private = info_dict
     //   .lookup(b"private")
@@ -118,25 +110,24 @@ impl MetaInfo {
 
     let name = info_dict
       .lookup(b"name")
-      .map(|x| x.str().map(|y| y.to_owned()))
-      .flatten()
-      .ok_or(anyhow!("Name missing"))?;
+      .and_then(|x| x.str().map(|y| y.to_owned()))
+      .ok_or_else(|| anyhow!("Name missing"))?;
 
     let mut files: Vec<File> = vec![];
 
     let mut file_is_malformed = false;
 
-    if let Some(length) = info_dict.lookup(b"length").map(|x| x.int()).flatten() {
+    if let Some(length) = info_dict.lookup(b"length").and_then(|x| x.int()) {
       files.push(File {
         length: length
           .try_into()
           .map_err(|_| anyhow!("Length is negative"))?,
-        path: vec![name.to_owned()],
+        path: vec![name],
       });
     } else {
       files = info_dict
         .lookup(b"files")
-        .map(|x| {
+        .and_then(|x| {
           x.list().map(|y| {
             y.into_iter()
               .filter_map(|f| {
@@ -144,14 +135,13 @@ impl MetaInfo {
 
                 let length = file_dict
                   .lookup(b"length")
-                  .map(|x| x.int())
-                  .flatten()
+                  .and_then(|x| x.int())
                   .ok_or_else(|| file_is_malformed = true)
                   .ok()?;
 
                 let mut path = file_dict
                   .lookup(b"path")
-                  .map(|x| {
+                  .and_then(|x| {
                     x.list().map(|y| {
                       y.into_iter()
                         .filter_map(|z| {
@@ -163,7 +153,6 @@ impl MetaInfo {
                         .collect::<Vec<String>>()
                     })
                   })
-                  .flatten()
                   .ok_or_else(|| file_is_malformed = true)
                   .ok()?;
 
@@ -180,8 +169,7 @@ impl MetaInfo {
               .collect::<Vec<File>>()
           })
         })
-        .flatten()
-        .ok_or(anyhow!("Files (and length) missing"))?;
+        .ok_or_else(|| anyhow!("Files (and length) missing"))?;
     }
 
     if file_is_malformed {
@@ -191,7 +179,7 @@ impl MetaInfo {
     let info_bencoded = root_dict
       .lookup(b"info")
       .map(|x| x.buffer())
-      .ok_or(anyhow!("Info missing or something"))?;
+      .ok_or_else(|| anyhow!("Info missing or something"))?;
 
     let info_hash = sha1_hash(info_bencoded);
 

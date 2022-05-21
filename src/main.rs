@@ -13,8 +13,8 @@ mod torrent;
 async fn main() {
   let path = Path::new("torrents/ubuntu.torrent");
 
-  let torrent = Torrent::from_file(&path, 6969).unwrap();
-  dbg!(torrent.metainfo.announce);
+  let torrent = Torrent::from_file(path, 6969).unwrap();
+  // dbg!(bytes::encode_bytes(&torrent.metainfo.info_hash));
 
   // dbg!(torrent.request_tracker(None).await);
   // dbg!(bytes::bytes_to_hexadecimal(&[

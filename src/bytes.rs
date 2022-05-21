@@ -5,7 +5,7 @@ pub fn sha1_hash(bytes: &[u8]) -> [u8; 20] {
   let mut hasher = Sha1::new();
   hasher.update(bytes);
   let hashed = hasher.finalize();
-  *hashed.array_chunks().nth(0).unwrap()
+  *hashed.array_chunks().next().unwrap()
 }
 
 pub fn random_id() -> [u8; 20] {
@@ -30,16 +30,17 @@ pub fn random_bytes() -> [u8; 20] {
 }
 
 pub fn encode_bytes(bytes: &[u8]) -> String {
-  // urlencoding::encode_binary(bytes).to_string()
-  let mut out: String = "".to_string();
-  for b in bytes {
-    match *b as char {
-      '0'..='9' | 'a'..='z' | 'A'..='Z' | '.' | '-' | '_' | '~' => out.push(*b as char),
-      _ => out += &format!("%{:02X}", b),
-    };
-  }
+  urlencoding::encode_binary(bytes).to_string()
 
-  out
+  // let mut out: String = "".to_string();
+  // for b in bytes {
+  //   match *b as char {
+  //     '0'..='9' | 'a'..='z' | 'A'..='Z' | '.' | '-' | '_' | '~' => out.push(*b as char),
+  //     _ => out += &format!("%{:02X}", b),
+  //   };
+  // }
+
+  // out
 }
 
 pub fn bytes_to_hexadecimal(bytes: &[u8]) -> String {
