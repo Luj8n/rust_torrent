@@ -1,5 +1,8 @@
+use anyhow::{anyhow, Result};
 use rand::prelude::*;
 use sha1::{Digest, Sha1};
+use std::io::Read;
+use std::path::Path;
 
 pub fn sha1_hash(bytes: &[u8]) -> [u8; 20] {
   let mut hasher = Sha1::new();
@@ -62,4 +65,12 @@ fn nibble_to_hexadeximal(nibble: u8) -> char {
     10..=15 => (nibble - 10 + 65) as char,
     _ => panic!("Not a nibble"),
   }
+}
+
+pub fn from_file(path: &Path) -> Result<Vec<u8>> {
+  let mut file = std::fs::File::open(path)?;
+  let mut bytes = vec![];
+  file.read_to_end(&mut bytes)?;
+
+  Ok(bytes)
 }

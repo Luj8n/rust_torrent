@@ -50,19 +50,23 @@ impl ToString for Event {
 }
 
 impl Torrent {
-  pub fn from_file(path: &Path, port: u16) -> Result<Self> {
-    let metainfo = MetaInfo::from_file(path)?;
+  pub fn from_bytes(bytes: &[u8], port: u16) -> Result<Self> {
+    let metainfo = MetaInfo::from_bytes(bytes)?;
+    Ok(Torrent::from_metainfo(metainfo, port))
+  }
+
+  fn from_metainfo(metainfo: MetaInfo, port: u16) -> Self {
     let peer_id = random_id();
     let left = metainfo.files.iter().map(|x| x.length).sum();
 
-    Ok(Torrent {
+    Torrent {
       metainfo,
       port,
       peer_id,
       uploaded: 0,
       downloaded: 0,
       left,
-    })
+    }
   }
 
   pub async fn request_tracker(

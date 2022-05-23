@@ -27,14 +27,9 @@ pub struct File {
 }
 
 impl MetaInfo {
-  pub fn from_file(path: &Path) -> Result<Self> {
-    let mut file = std::fs::File::open(path)?;
-    let mut bytes = vec![];
-    file.read_to_end(&mut bytes)?;
-
-    // dbg!(bytes.iter().map(|x| *x as char).collect::<String>());
+  pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
     let bencode =
-      BencodeRef::decode(&bytes, BDecodeOpt::default()).map_err(|e| anyhow!(e.to_string()))?;
+      BencodeRef::decode(bytes, BDecodeOpt::default()).map_err(|e| anyhow!(e.to_string()))?;
 
     MetaInfo::from_bencode(bencode)
   }
