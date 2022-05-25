@@ -3,8 +3,10 @@ use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
+use tokio::sync::mpsc::Sender;
 
 use crate::bytes::{encode_bytes, random_id};
+use crate::manager::{FileManager, Message};
 use crate::metainfo::MetaInfo;
 
 pub struct Torrent {
@@ -14,6 +16,9 @@ pub struct Torrent {
   pub uploaded: u64,
   pub downloaded: u64,
   pub left: u64,
+
+  file_manager_sender: Sender<Message>, // TODO: meh
+  // fs_file: FsFile // TODO
 }
 
 #[derive(Clone, Debug)]
@@ -50,12 +55,12 @@ impl ToString for Event {
 }
 
 impl Torrent {
-  pub fn from_bytes(bytes: &[u8], port: u16) -> Result<Self> {
+  pub fn from_bytes(bytes: &[u8], port: u16, file_manager_sender: Sender<Message>) -> Result<Self> {
     let metainfo = MetaInfo::from_bytes(bytes)?;
-    Ok(Torrent::from_metainfo(metainfo, port))
+    Ok(Torrent::from_metainfo(metainfo, port, file_manager_sender))
   }
 
-  fn from_metainfo(metainfo: MetaInfo, port: u16) -> Self {
+  fn from_metainfo(metainfo: MetaInfo, port: u16, file_manager_sender: Sender<Message>) -> Self {
     let peer_id = random_id();
     let left = metainfo.files.iter().map(|x| x.length).sum();
 
@@ -66,6 +71,7 @@ impl Torrent {
       uploaded: 0,
       downloaded: 0,
       left,
+      file_manager_sender,
     }
   }
 
