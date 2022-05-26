@@ -1,17 +1,17 @@
 use anyhow::{anyhow, Result};
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
-use std::fs::File as FsFile;
+use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::prelude::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 
 use crate::bytes::{encode_bytes, from_file, random_id};
 use crate::metainfo::{File, MetaInfo};
 use crate::torrent::Torrent;
-
-const DOWNLOAD_FOLDER: &str = "./tmp/";
 
 pub struct TorrentManager {
   file_manager: FileManager,
@@ -55,8 +55,7 @@ pub struct FileManager {
 pub enum Message {
   Write {
     bytes: Vec<u8>,
-    // file: &FsFile, // TODO
-    file: File,
+    file: Arc<fs::File>,
     offset: u64,
   },
 }
@@ -67,7 +66,6 @@ impl FileManager {
 
     tokio::spawn(async move {
       let mut rx = rx;
-      let mut open_files: Vec<(FsFile, String)> = vec![];
 
       while let Some(message) = rx.recv().await {
         use Message::*;
@@ -80,56 +78,12 @@ impl FileManager {
             file,
             offset,
           } => {
-            // let mut dir = std::env::current_dir().unwrap();
-            // dir.push(DOWNLOAD_FOLDER);
-
-            // for name in &file.path {
-            //   dir.push(name);
-            // }
-
-            // let mut file = FsFile::open(dir).unwrap();
-
-            // TODO move this to torrent impl
-
-            let file_path = file
-              .path
-              .iter()
-              .fold(DOWNLOAD_FOLDER.to_string(), |a, c| a + "/" + c);
-
-            let file = {
-              if let Some((file, _)) = open_files.iter().find(|(_, p)| *p == file_path) {
-                file
-              } else {
-                let file = FsFile::open(&file_path);
-
-                if file.is_err() {
-                  eprintln!("Couldn't create file, file path = {file_path}");
-                  continue;
-                }
-
-                open_files.push((file.unwrap(), file_path));
-
-                &open_files.last().unwrap().0
-              }
-            };
+            let result = file.write_all_at(&bytes, offset);
           }
         };
       }
     });
 
     FileManager { sender: tx }
-  }
-
-  async fn write_bytes(&self, bytes: Vec<u8>, file: File, offset: u64) -> Result<()> {
-    self
-      .sender
-      .send(Message::Write {
-        bytes,
-        file,
-        offset,
-      })
-      .await?;
-
-    Ok(())
   }
 }

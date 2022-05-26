@@ -1,13 +1,15 @@
 use anyhow::{anyhow, Result};
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
+use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use crate::bytes::{encode_bytes, random_id};
 use crate::manager::{FileManager, Message};
-use crate::metainfo::MetaInfo;
+use crate::metainfo::{self, MetaInfo};
 
 pub struct Torrent {
   pub metainfo: MetaInfo,
@@ -17,8 +19,8 @@ pub struct Torrent {
   pub downloaded: u64,
   pub left: u64,
 
-  file_manager_sender: Sender<Message>, // TODO: meh
-  // fs_file: FsFile // TODO
+  file_manager_sender: Sender<Message>,
+  files: Vec<FileInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +56,13 @@ impl ToString for Event {
   }
 }
 
+#[derive(Debug)]
+pub struct FileInfo {
+  pub fs_file: Arc<fs::File>,
+  pub length: u64,
+  pub offset: u64, // offset from the start of the first file (in bytes)
+}
+
 impl Torrent {
   pub fn from_bytes(bytes: &[u8], port: u16, file_manager_sender: Sender<Message>) -> Result<Self> {
     let metainfo = MetaInfo::from_bytes(bytes)?;
@@ -64,6 +73,30 @@ impl Torrent {
     let peer_id = random_id();
     let left = metainfo.files.iter().map(|x| x.length).sum();
 
+    let mut files = vec![];
+    let mut total_length = 0;
+
+    for file in &metainfo.files {
+      let mut dir = std::env::current_dir().unwrap();
+      dir.push("/tmp");
+
+      for name in &file.path {
+        dir.push(name);
+      }
+
+      let fs_file = Arc::new(fs::File::open(dir).unwrap());
+      let length = metainfo.piece_length;
+      let offset = total_length;
+
+      files.push(FileInfo {
+        fs_file,
+        length,
+        offset,
+      });
+
+      total_length += length;
+    }
+
     Torrent {
       metainfo,
       port,
@@ -72,7 +105,24 @@ impl Torrent {
       downloaded: 0,
       left,
       file_manager_sender,
+      files,
     }
+  }
+
+  pub async fn write_data(&self, bytes: Vec<u8>, offset: u64) {
+    self
+      .file_manager_sender
+      .send(Message::Write {
+        bytes,
+        file: self.files[0].fs_file.clone(),
+        offset,
+      })
+      .await
+      .expect("Shouldn't fail sending message to file manager");
+  }
+
+  async fn write_chunk(&self, index: u64, begin: u64, piece: Vec<u8>) {
+    todo!()
   }
 
   pub async fn request_tracker(
