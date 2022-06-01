@@ -7,6 +7,7 @@ use torrent::Torrent;
 mod bytes;
 mod manager;
 mod metainfo;
+mod peer;
 mod torrent;
 
 #[tokio::main]

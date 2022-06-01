@@ -48,11 +48,11 @@ impl TorrentManager {
 }
 
 pub struct FileManager {
-  sender: Sender<Message>,
+  sender: Sender<FileManagerMessage>,
 }
 
 #[derive(Debug, Clone)]
-pub enum Message {
+pub enum FileManagerMessage {
   Write {
     bytes: Vec<u8>,
     file: Arc<fs::File>,
@@ -62,13 +62,13 @@ pub enum Message {
 
 impl FileManager {
   fn new() -> Self {
-    let (tx, rx) = mpsc::channel::<Message>(32);
+    let (tx, rx) = mpsc::channel::<FileManagerMessage>(32);
 
     tokio::spawn(async move {
       let mut rx = rx;
 
       while let Some(message) = rx.recv().await {
-        use Message::*;
+        use FileManagerMessage::*;
 
         println!("Got message = {message:?}");
 

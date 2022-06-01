@@ -8,8 +8,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use crate::bytes::{encode_bytes, random_id};
-use crate::manager::{FileManager, Message};
+use crate::manager::{FileManager, FileManagerMessage};
 use crate::metainfo::{self, MetaInfo};
+use crate::peer::{self, Peer};
 
 pub struct Torrent {
   pub metainfo: MetaInfo,
@@ -19,39 +20,40 @@ pub struct Torrent {
   pub downloaded: u64,
   pub left: u64,
 
-  file_manager_sender: Sender<Message>,
+  file_manager_sender: Sender<FileManagerMessage>,
   files: Vec<FileInfo>,
+  peers: Vec<Peer>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TrackerResponse {
   warning_message: Option<String>,
-  interval: u64,
+  interval: u64, // TODO: make some timer, idk
   min_interval: Option<u64>,
   tracker_id: Option<String>,
   complete: u64,
   incomplete: u64,
-  peers: Vec<Peer>,
+  peer_info: Vec<PeerConnectionInfo>,
 }
 
 #[derive(Clone, Debug)]
-pub struct Peer {
+pub struct PeerConnectionInfo {
   ip: Ipv4Addr,
   port: u16,
 }
 
-pub enum Event {
+pub enum TrackerEvent {
   Started,
   Stopped,
   Completed,
 }
 
-impl ToString for Event {
+impl ToString for TrackerEvent {
   fn to_string(&self) -> String {
     match self {
-      Event::Started => "started".into(),
-      Event::Stopped => "stopped".into(),
-      Event::Completed => "completed".into(),
+      TrackerEvent::Started => "started".into(),
+      TrackerEvent::Stopped => "stopped".into(),
+      TrackerEvent::Completed => "completed".into(),
     }
   }
 }
@@ -64,12 +66,20 @@ pub struct FileInfo {
 }
 
 impl Torrent {
-  pub fn from_bytes(bytes: &[u8], port: u16, file_manager_sender: Sender<Message>) -> Result<Self> {
+  pub fn from_bytes(
+    bytes: &[u8],
+    port: u16,
+    file_manager_sender: Sender<FileManagerMessage>,
+  ) -> Result<Self> {
     let metainfo = MetaInfo::from_bytes(bytes)?;
     Ok(Torrent::from_metainfo(metainfo, port, file_manager_sender))
   }
 
-  fn from_metainfo(metainfo: MetaInfo, port: u16, file_manager_sender: Sender<Message>) -> Self {
+  fn from_metainfo(
+    metainfo: MetaInfo,
+    port: u16,
+    file_manager_sender: Sender<FileManagerMessage>,
+  ) -> Self {
     let peer_id = random_id();
     let left = metainfo.files.iter().map(|x| x.length).sum();
 
@@ -106,13 +116,19 @@ impl Torrent {
       left,
       file_manager_sender,
       files,
+      peers: vec![],
     }
+  }
+
+  pub fn start_downloading(&self) {
+    // add peers, check hash etc.
+    todo!()
   }
 
   pub async fn write_data(&self, bytes: Vec<u8>, offset: u64) {
     self
       .file_manager_sender
-      .send(Message::Write {
+      .send(FileManagerMessage::Write {
         bytes,
         file: self.files[0].fs_file.clone(),
         offset,
@@ -127,7 +143,7 @@ impl Torrent {
 
   pub async fn request_tracker(
     &self,
-    event: Option<Event>,
+    event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
     let protocol = self.metainfo.announce.split(':').next();
@@ -148,7 +164,7 @@ impl Torrent {
 
   async fn request_tracker_http(
     &self,
-    event: Option<Event>,
+    event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
     // let url = format!("{}/?{}&{}{}", self.metainfo.announce);
@@ -236,7 +252,7 @@ impl Torrent {
 
     let peers = peers_bytes
       .array_chunks::<6>()
-      .map(|[a, b, c, d, e, f]| Peer {
+      .map(|[a, b, c, d, e, f]| PeerConnectionInfo {
         ip: Ipv4Addr::new(*a, *b, *c, *d),
         port: ((*e as u16) << 8) + (*f as u16),
       })
@@ -249,13 +265,13 @@ impl Torrent {
       tracker_id,
       complete,
       incomplete,
-      peers,
+      peer_info: peers,
     })
   }
 
   pub async fn request_tracker_udp(
     &self,
-    event: Option<Event>,
+    event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
     todo!()
