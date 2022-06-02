@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use crate::bytes::{encode_bytes, random_id};
-use crate::manager::{FileManager, FileManagerMessage};
 use crate::metainfo::{self, MetaInfo};
 
 pub struct Peer {}
@@ -16,7 +15,7 @@ pub struct Peer {}
 #[derive(Debug, Clone)]
 pub enum PeerMessage {}
 
-impl PeerMessage {
+impl Peer {
   pub fn new() -> Self {
     todo!()
   }

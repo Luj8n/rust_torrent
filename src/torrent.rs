@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use crate::bytes::{encode_bytes, random_id};
-use crate::manager::{FileManager, FileManagerMessage};
+use crate::file_manager::{FileManager, FileManagerMessage};
 use crate::metainfo::{self, MetaInfo};
 use crate::peer::{self, Peer};
 
@@ -72,14 +72,14 @@ impl Torrent {
     file_manager_sender: Sender<FileManagerMessage>,
   ) -> Result<Self> {
     let metainfo = MetaInfo::from_bytes(bytes)?;
-    Ok(Torrent::from_metainfo(metainfo, port, file_manager_sender))
+    Torrent::from_metainfo(metainfo, port, file_manager_sender)
   }
 
   fn from_metainfo(
     metainfo: MetaInfo,
     port: u16,
     file_manager_sender: Sender<FileManagerMessage>,
-  ) -> Self {
+  ) -> Result<Self> {
     let peer_id = random_id();
     let left = metainfo.files.iter().map(|x| x.length).sum();
 
@@ -88,13 +88,22 @@ impl Torrent {
 
     for file in &metainfo.files {
       let mut dir = std::env::current_dir().unwrap();
-      dir.push("/tmp");
+      dir.push("tmp");
 
-      for name in &file.path {
+      for name in &file.path[0..file.path.len() - 1] {
         dir.push(name);
       }
+      fs::create_dir_all(&dir)?;
 
-      let fs_file = Arc::new(fs::File::open(dir).unwrap());
+      dir.push(
+        file
+          .path
+          .last()
+          .ok_or_else(|| anyhow!("Path is too short"))?,
+      );
+
+      // TODO: open existing file
+      let fs_file = Arc::new(fs::File::create(dir).unwrap());
       let length = metainfo.piece_length;
       let offset = total_length;
 
@@ -107,7 +116,7 @@ impl Torrent {
       total_length += length;
     }
 
-    Torrent {
+    Ok(Torrent {
       metainfo,
       port,
       peer_id,
@@ -117,12 +126,14 @@ impl Torrent {
       file_manager_sender,
       files,
       peers: vec![],
-    }
+    })
   }
 
-  pub fn start_downloading(&self) {
+  pub async fn start_downloading(&mut self) {
     // add peers, check hash etc.
-    todo!()
+    // todo!()
+    // let r = self.request_tracker(None, None).await;
+    // dbg!(r);
   }
 
   pub async fn write_data(&self, bytes: Vec<u8>, offset: u64) {

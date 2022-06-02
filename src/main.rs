@@ -2,9 +2,12 @@
 
 use std::path::Path;
 use torrent::Torrent;
+
+use crate::manager::TorrentManager;
 // use torrent_search::{search_l337x, TorrentSearchError, TorrentSearchResult};
 
 mod bytes;
+mod file_manager;
 mod manager;
 mod metainfo;
 mod peer;
@@ -12,12 +15,16 @@ mod torrent;
 
 #[tokio::main]
 async fn main() {
-  let path = Path::new("torrents/ubuntu.torrent");
+  let path = Path::new("torrents/simple.torrent");
 
-  // let torrent = Torrent::from_file(path, 6969).unwrap();
-  // dbg!(bytes::encode_bytes(&torrent.metainfo.info_hash));
+  let mut manager = TorrentManager::new();
+
+  let _ = manager.add_torrent_from_file(path);
 
   // dbg!(torrent.request_tracker(None).await);
+
+  // dbg!(bytes::encode_bytes(&torrent.metainfo.info_hash));
+
   // dbg!(bytes::bytes_to_hexadecimal(&[
   //   18, 52, 86, 120, 154, 188, 222, 241, 35, 69, 103, 137, 171, 205, 239, 18, 52, 86, 120, 154
   // ]));
