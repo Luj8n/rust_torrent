@@ -137,11 +137,13 @@ impl Torrent {
   }
 
   pub async fn write_data(&self, bytes: Vec<u8>, offset: u64) {
+    dbg!(&self.metainfo.files);
+
     self
       .file_manager_sender
       .send(FileManagerMessage::Write {
         bytes,
-        file: self.files[0].fs_file.clone(),
+        file: self.files[0].fs_file.clone(), // TODO
         offset,
       })
       .await

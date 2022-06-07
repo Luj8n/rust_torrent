@@ -21,6 +21,8 @@ async fn main() {
 
   let _ = manager.add_torrent_from_file(path);
 
+  let _ = manager.download_torrent(0).await;
+
   // dbg!(torrent.request_tracker(None).await);
 
   // dbg!(bytes::encode_bytes(&torrent.metainfo.info_hash));

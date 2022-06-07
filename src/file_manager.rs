@@ -51,6 +51,8 @@ impl FileManager {
           } => {
             // TODO: probably should buffer this
             let result = file.write_all_at(&bytes, offset);
+
+            // file.read_at(buf, offset)
           }
           Read {
             file,
