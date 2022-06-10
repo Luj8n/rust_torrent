@@ -22,3 +22,4 @@ torrent_search = { path = "libs/torrent-search-rs" }
 rand = "0.8.5"
 reqwest = "0.11.10"
 urlencoding = "2.1.0"
+futures = "0.3.21"

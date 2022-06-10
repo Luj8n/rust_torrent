@@ -7,6 +7,7 @@ use crate::manager::TorrentManager;
 // use torrent_search::{search_l337x, TorrentSearchError, TorrentSearchResult};
 
 mod bytes;
+mod constants;
 mod file_manager;
 mod manager;
 mod metainfo;

@@ -10,13 +10,23 @@ use tokio::sync::mpsc::Sender;
 use crate::bytes::{encode_bytes, random_id};
 use crate::metainfo::{self, MetaInfo};
 
-pub struct Peer {}
+pub struct Peer {
+  am_choking: bool,
+  am_interested: bool,
+  peer_choking: bool,
+  peer_interested: bool,
+}
 
 #[derive(Debug, Clone)]
 pub enum PeerMessage {}
 
 impl Peer {
   pub fn new() -> Self {
-    todo!()
+    Peer {
+      am_choking: true,
+      am_interested: false,
+      peer_choking: true,
+      peer_interested: false,
+    }
   }
 }

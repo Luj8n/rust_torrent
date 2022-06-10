@@ -17,7 +17,7 @@ pub struct FileManager {
   sender: Sender<FileManagerMessage>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum FileManagerMessage {
   Write {
     bytes: Vec<u8>,
@@ -27,7 +27,8 @@ pub enum FileManagerMessage {
   Read {
     file: Arc<fs::File>,
     offset: u64,
-    receiver: usize, // some type
+    length: u64,
+    sender: oneshot::Sender<Vec<u8>>,
   },
 }
 
@@ -41,7 +42,7 @@ impl FileManager {
       while let Some(message) = rx.recv().await {
         use FileManagerMessage::*;
 
-        println!("Got message = {message:?}");
+        // println!("Got message = {message:?}");
 
         match message {
           Write {
@@ -51,15 +52,20 @@ impl FileManager {
           } => {
             // TODO: probably should buffer this
             let result = file.write_all_at(&bytes, offset);
-
-            // file.read_at(buf, offset)
           }
           Read {
             file,
             offset,
-            receiver,
+            length,
+            sender,
           } => {
             // flush buffer if we have it
+
+            let mut bytes = vec![1; length as usize];
+
+            let bytes_read = file.read_at(&mut bytes, offset).unwrap();
+
+            sender.send(bytes).unwrap();
           }
           _ => {}
         };

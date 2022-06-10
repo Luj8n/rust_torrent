@@ -48,7 +48,10 @@ impl TorrentManager {
       return Err(anyhow!("Index out of torrent vec bounds"));
     };
 
-    self.torrents[index].write_data(vec![0; 10], 0).await;
+    dbg!(self.torrents[index].check_whole_hash().await);
+
+    // self.torrents[index].write_data(vec![0; 10], 0).await;
+    // self.torrents[index].read_data(0, 10).await;
     // self.torrents[index].start_downloading().await;
 
     Ok(())

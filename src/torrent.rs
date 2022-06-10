@@ -1,13 +1,16 @@
 use anyhow::{anyhow, Result};
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
+use futures::future::join_all;
 use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::oneshot;
 
-use crate::bytes::{encode_bytes, random_id};
+use crate::bytes::{encode_bytes, random_id, sha1_hash};
+use crate::constants::BLOCK_SIZE;
 use crate::file_manager::{FileManager, FileManagerMessage};
 use crate::metainfo::{self, MetaInfo};
 use crate::peer::{self, Peer};
@@ -60,7 +63,8 @@ impl ToString for TrackerEvent {
 
 #[derive(Debug)]
 pub struct FileInfo {
-  pub fs_file: Arc<fs::File>,
+  pub write_to: Arc<fs::File>,
+  pub read_from: Arc<fs::File>,
   pub length: u64,
   pub offset: u64, // offset from the start of the first file (in bytes)
 }
@@ -103,12 +107,17 @@ impl Torrent {
       );
 
       // TODO: open existing file
-      let fs_file = Arc::new(fs::File::create(dir).unwrap());
+      let write_to = Arc::new(fs::File::create(&dir).unwrap());
+      let read_from = Arc::new(fs::File::open(&dir).unwrap());
+
       let length = metainfo.piece_length;
       let offset = total_length;
 
+      // TODO: check hash of the (maybe existing) file
+
       files.push(FileInfo {
-        fs_file,
+        write_to,
+        read_from,
         length,
         offset,
       });
@@ -136,18 +145,110 @@ impl Torrent {
     // dbg!(r);
   }
 
-  pub async fn write_data(&self, bytes: Vec<u8>, offset: u64) {
-    dbg!(&self.metainfo.files);
+  pub fn get_file_sections(
+    &self,
+    piece_index: usize,
+    offset: u64,
+    length: u64,
+  ) -> Vec<(&FileInfo, u64, u64)> {
+    // (file, offset from file start, length)
+    let mut sum: u64 = 0;
 
+    let byte_start_offset = piece_index as u64 * self.metainfo.piece_length + offset;
+    let byte_end_offset = byte_start_offset + length;
+
+    let mut files = vec![];
+
+    for file in &self.files {
+      let file_start_offset = file.offset;
+      let file_end_offset = file_start_offset + file.length;
+
+      if byte_start_offset >= file_end_offset || byte_end_offset <= file_start_offset {
+        continue;
+      }
+
+      let intersection_start_offset = file_start_offset.max(byte_start_offset);
+      let intersection_end_offset = file_end_offset.min(byte_end_offset);
+
+      files.push((
+        file,
+        intersection_start_offset - file_start_offset,
+        intersection_end_offset - intersection_start_offset,
+      ));
+    }
+
+    files
+  }
+
+  pub async fn check_piece_hash(&self, piece_index: usize) -> bool {
+    let mut offset = 0;
+    while offset < self.metainfo.piece_length {
+      let bytes = join_all(
+        self
+          .get_file_sections(piece_index, offset, 20)
+          .iter()
+          .map(|f| self.read_data(f.0, f.1, f.2)),
+      )
+      .await
+      .concat();
+
+      let hashed = sha1_hash(&bytes);
+
+      if hashed != self.metainfo.pieces[piece_index] {
+        return false;
+      }
+
+      offset += 20;
+    }
+
+    true
+  }
+
+  // TODO: check if it works
+  pub async fn check_whole_hash(&self) -> Vec<bool> {
+    let byte_count = self.metainfo.files.iter().fold(0, |a, f| a + f.length);
+
+    join_all(
+      self
+        .get_file_sections(0, 0, byte_count)
+        .iter()
+        .map(|f| self.read_data(f.0, f.1, f.2)),
+    )
+    .await
+    .concat()
+    .chunks(20)
+    .zip(&self.metainfo.pieces)
+    .map(|(a, b)| a == b)
+    .collect()
+  }
+
+  pub async fn write_data(&self, file_info: &FileInfo, bytes: Vec<u8>, offset: u64) {
     self
       .file_manager_sender
       .send(FileManagerMessage::Write {
         bytes,
-        file: self.files[0].fs_file.clone(), // TODO
+        file: file_info.read_from.clone(),
         offset,
       })
       .await
       .expect("Shouldn't fail sending message to file manager");
+  }
+
+  pub async fn read_data(&self, file_info: &FileInfo, offset: u64, length: u64) -> Vec<u8> {
+    let (sender, receiver) = oneshot::channel();
+
+    self
+      .file_manager_sender
+      .send(FileManagerMessage::Read {
+        file: file_info.read_from.clone(),
+        offset,
+        length,
+        sender,
+      })
+      .await
+      .expect("Shouldn't fail sending message to file manager");
+
+    receiver.await.unwrap()
   }
 
   async fn write_chunk(&self, index: u64, begin: u64, piece: Vec<u8>) {
