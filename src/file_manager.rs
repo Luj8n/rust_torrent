@@ -42,7 +42,7 @@ impl FileManager {
       while let Some(message) = rx.recv().await {
         use FileManagerMessage::*;
 
-        // println!("Got message = {message:?}");
+        println!("Got message = {message:?}");
 
         match message {
           Write {
@@ -51,7 +51,7 @@ impl FileManager {
             offset,
           } => {
             // TODO: probably should buffer this
-            let result = file.write_all_at(&bytes, offset);
+            file.write_all_at(&bytes, offset).unwrap();
           }
           Read {
             file,
@@ -61,9 +61,11 @@ impl FileManager {
           } => {
             // flush buffer if we have it
 
-            let mut bytes = vec![1; length as usize];
+            let mut bytes = vec![0; length as usize];
 
             let bytes_read = file.read_at(&mut bytes, offset).unwrap();
+
+            // assert_eq!(length, bytes_read as u64);
 
             sender.send(bytes).unwrap();
           }

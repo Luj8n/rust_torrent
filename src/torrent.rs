@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
 use futures::future::join_all;
+use itertools::Itertools;
+use rayon::prelude::*;
 use std::fs;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
@@ -63,8 +65,7 @@ impl ToString for TrackerEvent {
 
 #[derive(Debug)]
 pub struct FileInfo {
-  pub write_to: Arc<fs::File>,
-  pub read_from: Arc<fs::File>,
+  pub file: Arc<fs::File>,
   pub length: u64,
   pub offset: u64, // offset from the start of the first file (in bytes)
 }
@@ -107,17 +108,20 @@ impl Torrent {
       );
 
       // TODO: open existing file
-      let write_to = Arc::new(fs::File::create(&dir).unwrap());
-      let read_from = Arc::new(fs::File::open(&dir).unwrap());
+      let open_file = fs::File::options()
+        .write(true)
+        .read(true)
+        .create(true)
+        .open(&dir)
+        .unwrap();
 
-      let length = metainfo.piece_length;
+      let length = file.length;
       let offset = total_length;
 
       // TODO: check hash of the (maybe existing) file
 
       files.push(FileInfo {
-        write_to,
-        read_from,
+        file: Arc::new(open_file),
         length,
         offset,
       });
@@ -152,7 +156,6 @@ impl Torrent {
     length: u64,
   ) -> Vec<(&FileInfo, u64, u64)> {
     // (file, offset from file start, length)
-    let mut sum: u64 = 0;
 
     let byte_start_offset = piece_index as u64 * self.metainfo.piece_length + offset;
     let byte_end_offset = byte_start_offset + length;
@@ -181,31 +184,27 @@ impl Torrent {
   }
 
   pub async fn check_piece_hash(&self, piece_index: usize) -> bool {
-    let mut offset = 0;
-    while offset < self.metainfo.piece_length {
-      let bytes = join_all(
-        self
-          .get_file_sections(piece_index, offset, 20)
-          .iter()
-          .map(|f| self.read_data(f.0, f.1, f.2)),
-      )
-      .await
-      .concat();
+    let bytes = join_all(
+      self
+        .get_file_sections(piece_index, 0, self.metainfo.piece_length)
+        .iter()
+        .map(|f| self.read_data(f.0, f.1, f.2)),
+    )
+    .await
+    .concat();
 
-      let hashed = sha1_hash(&bytes);
+    let hashed = sha1_hash(&bytes);
+    dbg!(hashed, self.metainfo.pieces[piece_index]);
 
-      if hashed != self.metainfo.pieces[piece_index] {
-        return false;
-      }
-
-      offset += 20;
+    if hashed != self.metainfo.pieces[piece_index] {
+      return false;
     }
 
     true
   }
 
-  // TODO: check if it works
-  pub async fn check_whole_hash(&self) -> Vec<bool> {
+  // TODO: only like 50% of hashes match up. FIX IT
+  pub async fn check_whole_hash(&self) -> usize {
     let byte_count = self.metainfo.files.iter().fold(0, |a, f| a + f.length);
 
     join_all(
@@ -216,10 +215,11 @@ impl Torrent {
     )
     .await
     .concat()
-    .chunks(20)
+    .chunks(self.metainfo.piece_length as usize)
+    .map(|b| sha1_hash(b))
     .zip(&self.metainfo.pieces)
-    .map(|(a, b)| a == b)
-    .collect()
+    .filter(|(a, b)| a == *b)
+    .count()
   }
 
   pub async fn write_data(&self, file_info: &FileInfo, bytes: Vec<u8>, offset: u64) {
@@ -227,7 +227,7 @@ impl Torrent {
       .file_manager_sender
       .send(FileManagerMessage::Write {
         bytes,
-        file: file_info.read_from.clone(),
+        file: file_info.file.clone(),
         offset,
       })
       .await
@@ -240,7 +240,7 @@ impl Torrent {
     self
       .file_manager_sender
       .send(FileManagerMessage::Read {
-        file: file_info.read_from.clone(),
+        file: file_info.file.clone(),
         offset,
         length,
         sender,

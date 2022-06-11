@@ -16,7 +16,7 @@ mod torrent;
 
 #[tokio::main]
 async fn main() {
-  let path = Path::new("torrents/simple.torrent");
+  let path = Path::new("torrents/ubuntu.torrent");
 
   let mut manager = TorrentManager::new();
 
