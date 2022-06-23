@@ -42,7 +42,7 @@ impl FileManager {
       while let Some(message) = rx.recv().await {
         use FileManagerMessage::*;
 
-        println!("Got message = {message:?}");
+        // println!("Got message = {message:?}");
 
         match message {
           Write {

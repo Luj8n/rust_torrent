@@ -22,7 +22,7 @@ async fn main() {
 
   let _ = manager.add_torrent_from_file(path);
 
-  let _ = manager.download_torrent(0).await;
+  // dbg!(&manager.torrents[0].metainfo);
 
   // dbg!(torrent.request_tracker(None).await);
 

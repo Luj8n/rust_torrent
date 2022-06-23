@@ -15,8 +15,8 @@ use crate::metainfo::{File, MetaInfo};
 use crate::torrent::Torrent;
 
 pub struct TorrentManager {
+  pub torrents: Vec<Torrent>,
   file_manager: FileManager,
-  torrents: Vec<Torrent>,
 }
 
 impl TorrentManager {
@@ -41,22 +41,6 @@ impl TorrentManager {
     let bytes = from_file(path)?;
 
     self.add_torrent(&bytes)
-  }
-
-  pub async fn download_torrent(&mut self, index: usize) -> Result<()> {
-    if index >= self.torrents.len() {
-      return Err(anyhow!("Index out of torrent vec bounds"));
-    };
-
-    // self.torrents[index].check_whole_hash().await;
-    // dbg!(self.torrents[index].check_piece_hash(0).await);
-    dbg!(self.torrents[index].check_whole_hash().await);
-
-    // self.torrents[index].write_data(vec![0; 10], 0).await;
-    // self.torrents[index].read_data(0, 10).await;
-    // self.torrents[index].start_downloading().await;
-
-    Ok(())
   }
 
   fn free_port(&self) -> Result<u16> {

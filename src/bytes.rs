@@ -8,7 +8,7 @@ pub fn sha1_hash(bytes: &[u8]) -> [u8; 20] {
   let mut hasher = Sha1::new();
   hasher.update(bytes);
   let hashed = hasher.finalize();
-  *hashed.array_chunks().next().unwrap()
+  hashed.try_into().unwrap()
 }
 
 pub fn random_id() -> [u8; 20] {

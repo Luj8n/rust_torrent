@@ -21,13 +21,13 @@ pub struct Torrent {
   pub metainfo: MetaInfo,
   pub port: u16,
   pub peer_id: [u8; 20],
-  pub uploaded: u64,
-  pub downloaded: u64,
-  pub left: u64,
+  pub bytes_uploaded: u64,
+  pub bytes_downloaded: u64,
 
   file_manager_sender: Sender<FileManagerMessage>,
   files: Vec<FileInfo>,
   peers: Vec<Peer>,
+  downloaded_pieces: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,7 +86,6 @@ impl Torrent {
     file_manager_sender: Sender<FileManagerMessage>,
   ) -> Result<Self> {
     let peer_id = random_id();
-    let left = metainfo.files.iter().map(|x| x.length).sum();
 
     let mut files = vec![];
     let mut total_length = 0;
@@ -118,8 +117,6 @@ impl Torrent {
       let length = file.length;
       let offset = total_length;
 
-      // TODO: check hash of the (maybe existing) file
-
       files.push(FileInfo {
         file: Arc::new(open_file),
         length,
@@ -130,12 +127,12 @@ impl Torrent {
     }
 
     Ok(Torrent {
+      downloaded_pieces: vec![false; metainfo.pieces.len()],
       metainfo,
       port,
       peer_id,
-      uploaded: 0,
-      downloaded: 0,
-      left,
+      bytes_uploaded: 0,
+      bytes_downloaded: 0,
       file_manager_sender,
       files,
       peers: vec![],
@@ -194,32 +191,18 @@ impl Torrent {
     .concat();
 
     let hashed = sha1_hash(&bytes);
-    dbg!(hashed, self.metainfo.pieces[piece_index]);
 
-    if hashed != self.metainfo.pieces[piece_index] {
-      return false;
-    }
-
-    true
+    hashed == self.metainfo.pieces[piece_index]
   }
 
-  // TODO: only like 50% of hashes match up. FIX IT
-  pub async fn check_whole_hash(&self) -> usize {
-    let byte_count = self.metainfo.files.iter().fold(0, |a, f| a + f.length);
+  pub async fn check_whole_hash(&self) -> Vec<bool> {
+    let mut v = vec![];
 
-    join_all(
-      self
-        .get_file_sections(0, 0, byte_count)
-        .iter()
-        .map(|f| self.read_data(f.0, f.1, f.2)),
-    )
-    .await
-    .concat()
-    .chunks(self.metainfo.piece_length as usize)
-    .map(|b| sha1_hash(b))
-    .zip(&self.metainfo.pieces)
-    .filter(|(a, b)| a == *b)
-    .count()
+    for i in 0..self.metainfo.pieces.len() {
+      v.push(self.check_piece_hash(i).await);
+    }
+
+    v
   }
 
   pub async fn write_data(&self, file_info: &FileInfo, bytes: Vec<u8>, offset: u64) {
@@ -255,6 +238,15 @@ impl Torrent {
     todo!()
   }
 
+  fn bytes_left(&self) -> u64 {
+    self
+      .downloaded_pieces
+      .iter()
+      .filter(|b| **b == false)
+      .count() as u64
+      * self.metainfo.piece_length
+  }
+
   pub async fn request_tracker(
     &self,
     event: Option<TrackerEvent>,
@@ -288,9 +280,9 @@ impl Torrent {
       .query(&[("peer_id", encode_bytes(&self.peer_id))])
       .query(&[("port", self.port)])
       .query(&[
-        ("uploaded", self.uploaded),
-        ("downloaded", self.downloaded),
-        ("left", self.left),
+        ("uploaded", self.bytes_uploaded),
+        ("downloaded", self.bytes_downloaded),
+        ("left", self.bytes_left()),
       ])
       .query(&[("compact", "1")]);
 
