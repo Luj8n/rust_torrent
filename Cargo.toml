@@ -13,10 +13,10 @@ codegen-units = 1
 
 
 [dependencies]
-tokio = { version = "1.20.0", features = ["full"] }
+tokio = { version = "1.20.1", features = ["full"] }
 sha1 = "0.10.1"
 # bytes = "1.1.0"
-anyhow = "1.0.58"
+anyhow = "1.0.59"
 bip_bencode = "0.4.4"
 torrent_search = { path = "libs/torrent-search-rs" }
 rand = "0.8.5"
