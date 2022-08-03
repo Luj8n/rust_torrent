@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use rand::prelude::*;
 use sha1::{Digest, Sha1};
 use std::io::Read;

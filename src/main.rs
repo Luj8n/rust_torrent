@@ -16,11 +16,17 @@ mod torrent;
 
 #[tokio::main]
 async fn main() {
-  let path = Path::new("torrents/ubuntu.torrent");
+  let path = Path::new("torrents/test.torrent");
 
   let mut manager = TorrentManager::new();
 
   let _ = manager.add_torrent_from_file(path);
+
+  dbg!(&manager.torrents[0]
+    .check_whole_hash()
+    .await
+    .iter()
+    .all(|x| *x));
 
   // dbg!(&manager.torrents[0].metainfo);
 

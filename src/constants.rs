@@ -1,1 +1,1 @@
-pub const BLOCK_SIZE: usize = 1 << 16;
+pub const BLOCK_SIZE: usize = 1 << 14;

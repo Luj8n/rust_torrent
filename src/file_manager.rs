@@ -1,17 +1,8 @@
-use anyhow::{anyhow, Result};
-use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
 use std::fs;
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::prelude::FileExt;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
-
-use crate::bytes::{encode_bytes, from_file, random_id};
-use crate::metainfo::{File, MetaInfo};
-use crate::torrent::Torrent;
 
 pub struct FileManager {
   sender: Sender<FileManagerMessage>,
@@ -69,7 +60,6 @@ impl FileManager {
 
             sender.send(bytes).unwrap();
           }
-          _ => {}
         };
       }
     });

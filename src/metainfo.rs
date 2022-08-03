@@ -1,7 +1,5 @@
 use anyhow::{anyhow, Result};
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
-use std::io::Read;
-use std::path::Path;
 
 use crate::bytes::sha1_hash;
 

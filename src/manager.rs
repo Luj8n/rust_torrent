@@ -1,21 +1,12 @@
-use anyhow::{anyhow, Result};
-use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
-use std::fs;
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr};
-use std::os::unix::prelude::FileExt;
+use anyhow::Result;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::mpsc::{self, Sender};
-use tokio::sync::oneshot;
 
-use crate::bytes::{encode_bytes, from_file, random_id};
-use crate::file_manager::{FileManager, FileManagerMessage};
-use crate::metainfo::{File, MetaInfo};
+use crate::bytes::from_file;
+use crate::file_manager::FileManager;
 use crate::torrent::Torrent;
 
 pub struct TorrentManager {
-  pub torrents: Vec<Torrent>,
+  pub torrents: Vec<Torrent>, // TODO: maybe a vector is not the best structure
   file_manager: FileManager,
 }
 
@@ -44,7 +35,7 @@ impl TorrentManager {
   }
 
   fn free_port(&self) -> Result<u16> {
-    // todo!()
+    // TODO
     Ok(6969)
   }
 }

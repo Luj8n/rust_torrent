@@ -1,21 +1,19 @@
 use anyhow::{anyhow, Result};
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
 use futures::future::join_all;
-use itertools::Itertools;
-use rayon::prelude::*;
 use std::fs;
-use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio::select;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
+use tokio::time::{self, Duration};
 
 use crate::bytes::{encode_bytes, random_id, sha1_hash};
-use crate::constants::BLOCK_SIZE;
-use crate::file_manager::{FileManager, FileManagerMessage};
-use crate::metainfo::{self, MetaInfo};
-use crate::peer::{self, Peer};
+use crate::file_manager::FileManagerMessage;
+use crate::metainfo::MetaInfo;
+use crate::peer::Peer;
 
 pub struct Torrent {
   pub metainfo: MetaInfo,
@@ -25,26 +23,20 @@ pub struct Torrent {
   pub bytes_downloaded: u64,
 
   file_manager_sender: Sender<FileManagerMessage>,
-  files: Vec<FileInfo>,
-  peers: Vec<Peer>,
-  downloaded_pieces: Vec<bool>,
+  files: Vec<FileInfo>, // TODO: later add a feature to choose which files to download
+  peers: Vec<Peer>,     // TODO: probably hashmap better
+  downloaded_pieces: Vec<bool>, // TODO: maybe store other piece data, like how many peers have them (if it is too slow to do it every second)
 }
 
 #[derive(Clone, Debug)]
 pub struct TrackerResponse {
   warning_message: Option<String>,
-  interval: u64, // TODO: make some timer, idk
+  interval: u64,
   min_interval: Option<u64>,
   tracker_id: Option<String>,
   complete: u64,
   incomplete: u64,
-  peer_info: Vec<PeerConnectionInfo>,
-}
-
-#[derive(Clone, Debug)]
-pub struct PeerConnectionInfo {
-  ip: Ipv4Addr,
-  port: u16,
+  peer_info: Vec<SocketAddr>,
 }
 
 pub enum TrackerEvent {
@@ -139,22 +131,41 @@ impl Torrent {
     })
   }
 
-  pub async fn start_downloading(&mut self) {
+  pub async fn start(&mut self) -> Result<()> {
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", self.port)).await?;
+    let mut interval = time::interval(Duration::from_millis(1000)); // TODO: experiment with other interval durations
+
     // add peers, check hash etc.
     // todo!()
     // let r = self.request_tracker(None, None).await;
     // dbg!(r);
+
+    // maybe spawn a task
+
+    loop {
+      select! {
+        _ = interval.tick() => {
+          // interval time has passed
+
+          // TODO: calculate rolling peer download/upload speed averages
+        }
+        new_peer_conn = listener.accept() => {
+          if let Ok(new_peer_conn) = new_peer_conn {
+            // TODO: add peer
+          }
+        }
+        // TODO: add an mpsc channel to listen for peer updates and update their stats
+        // TODO: add a timer for the tracker
+      };
+    }
+
+    Ok(())
   }
 
-  pub fn get_file_sections(
-    &self,
-    piece_index: usize,
-    offset: u64,
-    length: u64,
-  ) -> Vec<(&FileInfo, u64, u64)> {
+  pub fn get_file_sections(&self, offset: u64, length: u64) -> Vec<(&FileInfo, u64, u64)> {
     // (file, offset from file start, length)
 
-    let byte_start_offset = piece_index as u64 * self.metainfo.piece_length + offset;
+    let byte_start_offset = offset;
     let byte_end_offset = byte_start_offset + length;
 
     let mut files = vec![];
@@ -183,7 +194,10 @@ impl Torrent {
   pub async fn check_piece_hash(&self, piece_index: usize) -> bool {
     let bytes = join_all(
       self
-        .get_file_sections(piece_index, 0, self.metainfo.piece_length)
+        .get_file_sections(
+          piece_index as u64 * self.metainfo.piece_length,
+          self.metainfo.piece_length,
+        )
         .iter()
         .map(|f| self.read_data(f.0, f.1, f.2)),
     )
@@ -205,7 +219,7 @@ impl Torrent {
     v
   }
 
-  pub async fn write_data(&self, file_info: &FileInfo, bytes: Vec<u8>, offset: u64) {
+  async fn write_data(&self, file_info: &FileInfo, offset: u64, bytes: Vec<u8>) {
     self
       .file_manager_sender
       .send(FileManagerMessage::Write {
@@ -217,7 +231,7 @@ impl Torrent {
       .expect("Shouldn't fail sending message to file manager");
   }
 
-  pub async fn read_data(&self, file_info: &FileInfo, offset: u64, length: u64) -> Vec<u8> {
+  async fn read_data(&self, file_info: &FileInfo, offset: u64, length: u64) -> Vec<u8> {
     let (sender, receiver) = oneshot::channel();
 
     self
@@ -234,8 +248,40 @@ impl Torrent {
     receiver.await.unwrap()
   }
 
-  async fn write_chunk(&self, index: u64, begin: u64, piece: Vec<u8>) {
-    todo!()
+  pub async fn read_chunk(&self, piece_index: u64, offset: u64, length: u64) -> Vec<u8> {
+    // TODO: could implement some caching - save the whole piece in memory
+    join_all(
+      self
+        .get_file_sections(
+          piece_index as u64 * self.metainfo.piece_length,
+          self.metainfo.piece_length,
+        )
+        .iter()
+        .map(|f| self.read_data(f.0, f.1, f.2)),
+    )
+    .await
+    .concat()
+  }
+
+  pub async fn write_chunk(&self, piece_index: u64, offset: u64, bytes: Vec<u8>) {
+    let sections = self.get_file_sections(
+      piece_index as u64 * self.metainfo.piece_length,
+      bytes.len() as u64,
+    );
+
+    let mut cur_byte_offset = 0;
+
+    for (file_info, chunk_offset, chunk_length) in sections {
+      self
+        .write_data(
+          file_info,
+          chunk_offset,
+          bytes[cur_byte_offset as usize..(cur_byte_offset + chunk_length) as usize].to_vec(),
+        )
+        .await;
+
+      cur_byte_offset += chunk_length;
+    }
   }
 
   fn bytes_left(&self) -> u64 {
@@ -358,9 +404,11 @@ impl Torrent {
 
     let peers = peers_bytes
       .array_chunks::<6>()
-      .map(|[a, b, c, d, e, f]| PeerConnectionInfo {
-        ip: Ipv4Addr::new(*a, *b, *c, *d),
-        port: ((*e as u16) << 8) + (*f as u16),
+      .map(|[a, b, c, d, e, f]| {
+        SocketAddr::new(
+          IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d)),
+          ((*e as u16) << 8) + (*f as u16),
+        )
       })
       .collect();
 
