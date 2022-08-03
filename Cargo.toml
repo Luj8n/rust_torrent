@@ -18,7 +18,6 @@ sha1 = "0.10.1"
 # bytes = "1.1.0"
 anyhow = "1.0.59"
 bip_bencode = "0.4.4"
-torrent_search = { path = "libs/torrent-search-rs" }
 rand = "0.8.5"
 reqwest = "0.11.11"
 urlencoding = "2.1.0"
