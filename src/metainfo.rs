@@ -87,8 +87,8 @@ impl MetaInfo {
           // TODO: find a way to clean this up a bit
           let mut pieces: Vec<[u8; 20]> = vec![];
 
-          for chunk in bytes.array_chunks() {
-            pieces.push(chunk.to_owned());
+          for chunk in bytes.chunks_exact(20) {
+            pieces.push(chunk.try_into().unwrap());
           }
 
           pieces

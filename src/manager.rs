@@ -1,12 +1,13 @@
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::bytes::from_file;
 use crate::file_manager::FileManager;
 use crate::torrent::Torrent;
 
 pub struct TorrentManager {
-  pub torrents: Vec<Torrent>, // TODO: maybe a vector is not the best structure
+  pub torrents: Vec<Arc<Torrent>>, // TODO: maybe a vector is not the best structure
   file_manager: FileManager,
 }
 
@@ -34,8 +35,9 @@ impl TorrentManager {
     self.add_torrent(&bytes)
   }
 
-  fn free_port(&self) -> Result<u16> {
-    // TODO
-    Ok(6969)
+  pub fn free_port(&self) -> Result<u16> {
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    Ok(listener.local_addr()?.port())
   }
 }
