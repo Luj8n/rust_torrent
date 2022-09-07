@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use std::{
   net::SocketAddr,
   sync::{Arc, Weak},
+  time::Duration,
 };
 
 use tokio::{
@@ -9,9 +10,10 @@ use tokio::{
   net::TcpStream,
   select,
   sync::Mutex,
+  time,
 };
 
-use crate::torrent::Torrent;
+use crate::{bytes::sha1_hash, constants::MAX_ALLOWED_BLOCK_SIZE, torrent::Torrent};
 
 pub struct Peer {
   address: SocketAddr,
@@ -24,6 +26,9 @@ pub struct Peer {
 
   downloaded_from: Mutex<u64>,
   uploaded_to: Mutex<u64>,
+  downloaded_from_rate: Mutex<u64>, // bytes per second
+  uploaded_to_rate: Mutex<u64>,     // bytes per second
+
   piece_availability: Mutex<Vec<bool>>,
 
   torrent: Weak<Torrent>,
@@ -43,6 +48,9 @@ impl Peer {
 
       downloaded_from: Mutex::new(0),
       uploaded_to: Mutex::new(0),
+      downloaded_from_rate: Mutex::new(0),
+      uploaded_to_rate: Mutex::new(0),
+
       piece_availability: Mutex::new(vec![
         false;
         torrent.clone().upgrade().unwrap().metainfo.pieces.len()
@@ -139,6 +147,14 @@ impl Peer {
         .await
         .unwrap();
 
+      let mut interval = time::interval(Duration::from_millis(1000));
+
+      //                       index begin length
+      let mut requested_pieces: Vec<(u32, u32, u32)> = vec![];
+
+      let mut downloaded_from_last_second = 0;
+      let mut uploaded_to_last_second = 0;
+
       loop {
         select! {
           Ok(_) = stream.readable() => {
@@ -209,7 +225,7 @@ impl Peer {
 
                           if actual_len < peer.piece_availability.lock().await.len() {
                             // TODO: disconnect
-                            panic!();
+                            todo!();
                           }
 
                           *peer.piece_availability.lock().await = bitfield[..actual_len].to_vec();
@@ -224,6 +240,9 @@ impl Peer {
                         let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
                         let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
                         let length = u32::from_be_bytes(buf[13..17].try_into().unwrap());
+                        if length > MAX_ALLOWED_BLOCK_SIZE {
+                          todo!();
+                        }
 
                         let chunk = torrent.read_chunk(index, begin as u64, length as u64).await;
 
@@ -231,36 +250,66 @@ impl Peer {
                       }
                       7 => {
                         // PIECE
+
+                        if *peer.am_choking.lock().await {
+                          continue;
+                        }
+
+                        let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
+                        let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
+                        let block = buf[13..].to_vec();
+
+                        if let Some(pos) = requested_pieces.iter().position(|(a, b, c)| *a == index && *b == begin && *c == block.len() as u32) {
+                          requested_pieces.remove(pos);
+
+                          // check hash
+                          let hashed = sha1_hash(&block);
+                          // FIXME: we get a block, not a piece. so need to wait for a whole piece.
+                          // Torrent needs to keep track of currently downloading piece.
+                          // After a piece is downloaded only then check the hash and if it doesnt match try again
+
+                          // if hashed == torrent.metainfo.pieces[index as usize] {
+                          //   // good block
+                          //   torrent.write_chunk(index, begin as u64, block).await;
+                          // } else {
+                          //   // bad block
+                          //   // TODO: put back on the queue
+                          // }
+
+                          // let chunk = torrent.read_chunk(index, begin as u64, length as u64).await;
+                        }
                       }
                       8 => {
                         // CANCEL
+                        // there isn't really a use for this?
                       }
                       _ => {
                         // TODO: disconnect client
+                        todo!();
                       }
                     }
                   }
                   Err(_) => {
                     // TODO: disconnect client
+                    todo!();
                   }
                 }
               }
             }
           }
 
-          // // update stats every second*
-          // _ = interval.tick() => {
-          //   // TODO: calculate rolling peer download/upload speed averages
-          //   // dbg!();
-          // }
+          // update stats every second
+          _ = interval.tick() => {
+            // calculate rolling peer download/upload speed averages
+            let downloaded_from_now = *peer.downloaded_from.lock().await;
+            let uploaded_to_now = *peer.uploaded_to.lock().await;
 
-          // an mpsc channel to listen for peer updates and update their stats
-          // Some(msg) = rx.recv() => {
-          //   match msg {
+            *peer.downloaded_from_rate.lock().await = downloaded_from_now - downloaded_from_last_second;
+            *peer.uploaded_to_rate.lock().await = uploaded_to_now - uploaded_to_last_second;
 
-          //   }
-          // }
-          // TODO: add a timer for the tracker
+            downloaded_from_last_second = downloaded_from_now;
+            uploaded_to_last_second = uploaded_to_now;
+          }
         };
       }
     });

@@ -281,7 +281,7 @@ impl Torrent {
     .concat()
   }
 
-  async fn write_chunk(&self, piece_index: u32, offset: u64, bytes: Vec<u8>) {
+  pub async fn write_chunk(&self, piece_index: u32, offset: u64, bytes: Vec<u8>) {
     let sections = self.get_file_sections(
       piece_index as u64 * self.metainfo.piece_length + offset,
       bytes.len() as u64,
