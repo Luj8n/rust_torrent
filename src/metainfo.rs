@@ -7,11 +7,11 @@ use crate::bytes::sha1_hash;
 pub struct MetaInfo {
   pub announce: String,
   // pub announce_list: Option<Vec<String>>,
-  pub creation_date: Option<u64>,
+  pub creation_date: Option<u32>,
   pub comment: Option<String>,
   pub created_by: Option<String>,
   // pub encoding: Option<String>,
-  pub piece_length: u64,
+  pub piece_length: u32,
   pub pieces: Vec<[u8; 20]>,
   // pub private: Option<bool>,
   pub files: Vec<File>,
@@ -20,7 +20,7 @@ pub struct MetaInfo {
 
 #[derive(Clone, Debug)]
 pub struct File {
-  pub length: u64,
+  pub length: u32,
   pub path: Vec<String>,
 }
 

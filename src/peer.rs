@@ -1,42 +1,72 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::{
   net::SocketAddr,
   sync::{Arc, Weak},
   time::Duration,
 };
-
 use tokio::{
   io::{AsyncReadExt, AsyncWriteExt},
   net::TcpStream,
   select,
+  sync::mpsc::{self, Sender},
   sync::Mutex,
   time,
 };
 
-use crate::{bytes::sha1_hash, constants::MAX_ALLOWED_BLOCK_SIZE, torrent::Torrent};
+use crate::{
+  bytes::sha1_hash,
+  constants::{self, MAX_ALLOWED_BLOCK_SIZE},
+  torrent::{Torrent, TorrentMessage},
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct BlockInfo {
+  pub index: u32, // piece index
+  pub begin: u32, // offset
+  pub length: u32,
+}
+
+#[derive(Debug)]
+pub struct Block {
+  pub info: BlockInfo,
+  pub bytes: Vec<u8>,
+}
+
+// TODO: add trait Chunk and methods for it
+
+// TODO: add requests for pieces and pipelining
 
 pub struct Peer {
-  address: SocketAddr,
+  pub address: SocketAddr,
   peer_id: Mutex<Option<[u8; 20]>>, // before handshake it's None
 
-  am_choking: Mutex<bool>,
-  am_interested: Mutex<bool>,
-  peer_choking: Mutex<bool>,
-  peer_interested: Mutex<bool>,
+  pub am_choking: Mutex<bool>,
+  pub am_interested: Mutex<bool>,
+  pub peer_choking: Mutex<bool>,
+  pub peer_interested: Mutex<bool>,
 
-  downloaded_from: Mutex<u64>,
-  uploaded_to: Mutex<u64>,
-  downloaded_from_rate: Mutex<u64>, // bytes per second
-  uploaded_to_rate: Mutex<u64>,     // bytes per second
+  downloaded_from: Mutex<u32>, // total downloaded bytes
+  uploaded_to: Mutex<u32>,     // total uploaded bytes
 
-  piece_availability: Mutex<Vec<bool>>,
+  rolling_download: Mutex<Vec<u32>>,
+  rolling_upload: Mutex<Vec<u32>>,
+
+  pub downloaded_from_rate: Mutex<u32>, // rolling average, updated every second
+  pub uploaded_to_rate: Mutex<u32>,     // rolling average, updated every second
+
+  pub piece_availability: Mutex<Vec<bool>>,
 
   torrent: Weak<Torrent>,
+  torrent_sender: Sender<TorrentMessage>,
   peer: Weak<Peer>,
 }
 
 impl Peer {
-  pub fn new(address: SocketAddr, torrent: Weak<Torrent>) -> Arc<Self> {
+  pub fn new(
+    address: SocketAddr,
+    torrent: Weak<Torrent>,
+    torrent_sender: Sender<TorrentMessage>,
+  ) -> Arc<Self> {
     Arc::new_cyclic(|me| Peer {
       address,
       peer_id: Mutex::new(None),
@@ -48,6 +78,10 @@ impl Peer {
 
       downloaded_from: Mutex::new(0),
       uploaded_to: Mutex::new(0),
+
+      rolling_download: Mutex::new(vec![]),
+      rolling_upload: Mutex::new(vec![]),
+
       downloaded_from_rate: Mutex::new(0),
       uploaded_to_rate: Mutex::new(0),
 
@@ -56,14 +90,17 @@ impl Peer {
         torrent.clone().upgrade().unwrap().metainfo.pieces.len()
       ]),
 
-      peer: me.clone(),
       torrent,
+      torrent_sender,
+      peer: me.clone(),
     })
   }
 
-  pub async fn start(&self, stream: Option<TcpStream>) -> Result<()> {
+  pub fn start(&self, stream: Option<TcpStream>) -> Result<()> {
     let peer = self.peer.upgrade().unwrap();
     let torrent = peer.torrent.upgrade().unwrap();
+
+    // TODO: replace most unwraps/expects with disconnection
 
     tokio::spawn(async move {
       let mut stream = {
@@ -147,15 +184,14 @@ impl Peer {
         .await
         .unwrap();
 
-      let mut interval = time::interval(Duration::from_millis(1000));
+      let mut one_sec_interval = time::interval(Duration::from_millis(1000));
 
-      //                       index begin length
-      let mut requested_pieces: Vec<(u32, u32, u32)> = vec![];
+      let mut requested_pieces: Vec<BlockInfo> = vec![];
 
       let mut downloaded_from_last_second = 0;
       let mut uploaded_to_last_second = 0;
 
-      loop {
+      'main_loop: loop {
         select! {
           Ok(_) = stream.readable() => {
             let mut length_buf = [0_u8; 4];
@@ -190,6 +226,13 @@ impl Peer {
                       2 => {
                         // INTERESTED
                         *peer.peer_interested.lock().await = true;
+
+                        // TODO: maybe don't send message
+                        peer
+                          .torrent_sender
+                          .send(TorrentMessage::InterstedPeer(peer.address))
+                          .await
+                          .unwrap();
                       }
                       3 => {
                         // NOT_INTERESTED
@@ -224,8 +267,8 @@ impl Peer {
                           let actual_len = torrent.metainfo.pieces.len();
 
                           if actual_len < peer.piece_availability.lock().await.len() {
-                            // TODO: disconnect
-                            todo!();
+                            // disconnect client
+                            break 'main_loop;
                           }
 
                           *peer.piece_availability.lock().await = bitfield[..actual_len].to_vec();
@@ -234,6 +277,7 @@ impl Peer {
                         // REQUEST
 
                         if *peer.am_choking.lock().await {
+                          // don't upload to choked peers
                           continue;
                         }
 
@@ -241,12 +285,19 @@ impl Peer {
                         let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
                         let length = u32::from_be_bytes(buf[13..17].try_into().unwrap());
                         if length > MAX_ALLOWED_BLOCK_SIZE {
-                          todo!();
+                          // disconnect
+                          break 'main_loop;
                         }
 
-                        let chunk = torrent.read_chunk(index, begin as u64, length as u64).await;
+                        // i don't think it actually means to send it immediately, just when you get it. that's probably why "CANCEL" exists
+                        // TODO: find out how it actually should be
+
+                        let chunk = torrent.read_block(&BlockInfo { index, begin, length }).await;
 
                         stream.write_all(&Peer::piece_message(index, begin, &chunk)).await.unwrap();
+
+                        // update bytes uploaded
+                        *peer.uploaded_to.lock().await += length;
                       }
                       7 => {
                         // PIECE
@@ -259,39 +310,32 @@ impl Peer {
                         let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
                         let block = buf[13..].to_vec();
 
-                        if let Some(pos) = requested_pieces.iter().position(|(a, b, c)| *a == index && *b == begin && *c == block.len() as u32) {
-                          requested_pieces.remove(pos);
+                        if let Some(pos) = requested_pieces.iter().position(|data| data.index == index && data.begin == begin && data.length == block.len() as u32) {
+                          // only requested pieces are accepted
 
-                          // check hash
-                          let hashed = sha1_hash(&block);
-                          // FIXME: we get a block, not a piece. so need to wait for a whole piece.
-                          // Torrent needs to keep track of currently downloading piece.
-                          // After a piece is downloaded only then check the hash and if it doesnt match try again
+                          let info = requested_pieces.remove(pos);
 
-                          // if hashed == torrent.metainfo.pieces[index as usize] {
-                          //   // good block
-                          //   torrent.write_chunk(index, begin as u64, block).await;
-                          // } else {
-                          //   // bad block
-                          //   // TODO: put back on the queue
-                          // }
+                          // update bytes downloaded
+                          *peer.downloaded_from.lock().await += info.length;
 
-                          // let chunk = torrent.read_chunk(index, begin as u64, length as u64).await;
+                          peer.torrent_sender.send(TorrentMessage::BlockDownloaded(Block { info, bytes: block })).await.unwrap();
                         }
                       }
                       8 => {
                         // CANCEL
                         // there isn't really a use for this?
+                        // TODO
                       }
                       _ => {
-                        // TODO: disconnect client
-                        todo!();
+                        // disconnect client
+                        break 'main_loop;
+
                       }
                     }
                   }
                   Err(_) => {
-                    // TODO: disconnect client
-                    todo!();
+                    // disconnect client
+                    break 'main_loop;
                   }
                 }
               }
@@ -299,19 +343,38 @@ impl Peer {
           }
 
           // update stats every second
-          _ = interval.tick() => {
+          _ = one_sec_interval.tick() => {
             // calculate rolling peer download/upload speed averages
             let downloaded_from_now = *peer.downloaded_from.lock().await;
             let uploaded_to_now = *peer.uploaded_to.lock().await;
 
-            *peer.downloaded_from_rate.lock().await = downloaded_from_now - downloaded_from_last_second;
-            *peer.uploaded_to_rate.lock().await = uploaded_to_now - uploaded_to_last_second;
+            let download_delta = downloaded_from_now - downloaded_from_last_second;
+            let upload_delta = uploaded_to_now - uploaded_to_last_second;
+
+            let mut rolling_download = peer.rolling_download.lock().await;
+            let mut rolling_upload = peer.rolling_upload.lock().await;
+
+            rolling_download.insert(0, download_delta);
+            rolling_upload.insert(0, upload_delta);
+
+            rolling_download.truncate(constants::ROLLING_AVERAGE_SIZE as usize);
+            rolling_upload.truncate(constants::ROLLING_AVERAGE_SIZE as usize);
+
+            *peer.downloaded_from_rate.lock().await = rolling_download.iter().sum::<u32>() / rolling_download.len() as u32;
+            *peer.uploaded_to_rate.lock().await = rolling_upload.iter().sum::<u32>() / rolling_upload.len() as u32;
 
             downloaded_from_last_second = downloaded_from_now;
             uploaded_to_last_second = uploaded_to_now;
           }
         };
       }
+
+      // want to disconnect, send message to torrent manager
+      peer
+        .torrent_sender
+        .send(TorrentMessage::DisconnectPeer(peer.address))
+        .await
+        .unwrap();
     });
 
     Ok(())

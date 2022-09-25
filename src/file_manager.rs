@@ -13,12 +13,12 @@ pub enum FileManagerMessage {
   Write {
     bytes: Vec<u8>,
     file: Arc<fs::File>,
-    offset: u64,
+    offset: u32,
   },
   Read {
     file: Arc<fs::File>,
-    offset: u64,
-    length: u64,
+    offset: u32,
+    length: u32,
     sender: oneshot::Sender<Vec<u8>>,
   },
 }
@@ -42,7 +42,7 @@ impl FileManager {
             offset,
           } => {
             // TODO: probably should buffer this
-            file.write_all_at(&bytes, offset).unwrap();
+            file.write_all_at(&bytes, offset as u64).unwrap();
           }
           Read {
             file,
@@ -54,9 +54,9 @@ impl FileManager {
 
             let mut bytes = vec![0; length as usize];
 
-            let bytes_read = file.read_at(&mut bytes, offset).unwrap();
+            let bytes_read = file.read_at(&mut bytes, offset as u64).unwrap();
 
-            // assert_eq!(length, bytes_read as u64);
+            // assert_eq!(length, bytes_read as u32);
 
             sender.send(bytes).unwrap();
           }
