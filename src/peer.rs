@@ -230,7 +230,7 @@ impl Peer {
                         // TODO: maybe don't send message
                         peer
                           .torrent_sender
-                          .send(TorrentMessage::InterstedPeer(peer.address))
+                          .send(TorrentMessage::InterestedPeer(peer.address))
                           .await
                           .unwrap();
                       }

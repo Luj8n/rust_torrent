@@ -32,6 +32,9 @@ pub struct Torrent {
 
   pub blocks_to_download: Mutex<Vec<BlockInfo>>,
   torrent: Weak<Torrent>,
+
+  downloading_piece_info: Mutex<Option<BlockInfo>>,
+  downloading_piece: Mutex<Vec<Option<Block>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +75,7 @@ pub struct FileInfo {
 pub enum TorrentMessage {
   BlockDownloaded(Block),
   DisconnectPeer(SocketAddr),
-  InterstedPeer(SocketAddr),
+  InterestedPeer(SocketAddr),
 }
 
 impl Torrent {
@@ -147,6 +150,9 @@ impl Torrent {
 
       blocks_to_download: Mutex::new(vec![]),
       torrent: me.clone(),
+
+      downloading_piece_info: Mutex::new(None),
+      downloading_piece: Mutex::new(vec![]),
     }))
   }
 
@@ -186,9 +192,6 @@ impl Torrent {
       }
 
       *torrent.peers.lock().await = peers;
-
-      let mut downloading_piece_info: Option<BlockInfo> = None;
-      let mut downloading_piece: Vec<Option<Block>> = vec![];
 
       let mut unchoked_peers: Vec<SocketAddr> = vec![];
       let mut optimistic_unchoke_peer: Option<SocketAddr> = None;
@@ -271,101 +274,6 @@ impl Torrent {
               optimistic_unchoke_peer = None;
             }
           }
-          _ = interval.tick() => {
-            // move this to function and remove this interval
-            if downloading_piece.iter().all(|x| x.is_some()) && downloading_piece_info.is_some() {
-              let mut blocks_to_download = torrent.blocks_to_download.lock().await;
-
-              let piece: Vec<u8> = {
-                let mut bytes: Vec<u8> = vec![];
-                for block in &mut downloading_piece {
-                  bytes.append(&mut block.as_mut().unwrap().bytes);
-                }
-                bytes
-              };
-
-              assert!(blocks_to_download.is_empty()); // TODO ?
-
-              // check hash
-              let hashed = sha1_hash(&piece);
-              if hashed != torrent.metainfo.pieces[downloading_piece_info.unwrap().index as usize] {
-                // bad piece: some downloaded block was not correct
-                println!("Bad piece");
-
-                for block in &mut downloading_piece {
-                  // TODO: technically we don't need to download every block again
-                  // all we need to do keep old blocks (one or more of them are wrong)
-                  // and after downloading a block exchange the old block with the new one and check if hashes match up
-                  // although, i don't think it's worth it because bad blocks are probably rare (hopefully)
-                  blocks_to_download.push(block.as_ref().unwrap().info);
-                  *block = None;
-                }
-              } else {
-                // good piece
-                println!("Downloaded a piece");
-
-                // write it to disk
-                torrent
-                  .write_block(&Block {
-                    bytes: piece,
-                    info: BlockInfo {
-                      index: downloading_piece_info.unwrap().index,
-                      begin: downloading_piece_info.unwrap().begin,
-                      length: downloading_piece_info.unwrap().length,
-                    },
-                  })
-                  .await;
-
-                // mark it as downloaded
-                torrent.downloaded_pieces.lock().await[downloading_piece_info.unwrap().index as usize] = true;
-
-                // check if download is finished
-                if torrent.downloaded_pieces.lock().await.iter().all(|x| *x) {
-                  // download finished
-                  println!("Download finished");
-                  downloading_piece_info = None;
-                  // TODO: switch to seeding mode
-                } else {
-                  // download not finished
-
-                  // choose next piece
-                  // TODO: add other methods like rarest first, random
-                  // pick the next not download piece
-                  let piece_index: u32 = torrent.downloaded_pieces.lock().await.iter().position(|x| *x == false).unwrap() as u32;
-
-                  // get length of selected piece
-                  let piece_start = piece_index * torrent.metainfo.piece_length;
-                  let piece_length = {
-                    let end = {
-                      let maybe_end = piece_start + torrent.metainfo.piece_length;
-                      let max_end = {
-                        let last_file = torrent.files.last().unwrap();
-                        last_file.offset + last_file.length
-                      };
-
-                      maybe_end.min(max_end)
-                    };
-                    end - piece_start
-                  };
-                  let count = (piece_length + piece_length % constants::BLOCK_SIZE) / constants::BLOCK_SIZE;
-
-                  downloading_piece = vec![];
-
-                  for i in 0..count {
-                    let block_start = constants::BLOCK_SIZE * i;
-                    let block_end = (block_start + constants::BLOCK_SIZE).max(piece_length);
-
-                    downloading_piece.push(None);
-                    blocks_to_download.push(BlockInfo { index: i, begin: block_start, length: block_end - block_start });
-                  }
-
-                  // set new piece info as the downloading piece info
-                  downloading_piece_info = Some(BlockInfo { index: piece_index, begin: piece_start, length: piece_length })
-                }
-              }
-            }
-
-          }
 
           // listen for new peers joining
           Ok((stream, socket)) = listener.accept() => {
@@ -380,15 +288,17 @@ impl Torrent {
             match msg {
               BlockDownloaded(block) => {
                 let index = block.info.index;
-                downloading_piece[index as usize] = Some(block);
+                torrent.downloading_piece.lock().await[index as usize] = Some(block);
 
-                // TODO: call (and create) function to check if piece is finished
+                // check if piece is finished
+                torrent.try_choose_new_piece().await;
               }
               DisconnectPeer(address) => {
                 torrent.peers.lock().await.retain(|x| x.address != address);
               }
-              InterstedPeer(address) => {
-                // TODO
+              InterestedPeer(address) => {
+                // TODO: Peers which have a better upload rate (as compared to the downloaders) but aren't interested get unchoked.
+                // If they become *interested*, the downloader with the worst upload rate gets choked.
               }
             }
           }
@@ -398,6 +308,119 @@ impl Torrent {
     });
 
     tx_clone
+  }
+
+  async fn try_choose_new_piece(&self) {
+    let mut downloading_piece = self.downloading_piece.lock().await;
+    let mut downloading_piece_info = self.downloading_piece_info.lock().await;
+
+    // check if the piece, which is currently being downloaded, has completely downloaded
+    if downloading_piece.iter().all(|x| x.is_some()) && downloading_piece_info.is_some() {
+      let mut blocks_to_download = self.blocks_to_download.lock().await;
+
+      let piece: Vec<u8> = {
+        let mut bytes: Vec<u8> = vec![];
+        for block in &mut *downloading_piece {
+          bytes.append(&mut block.as_mut().unwrap().bytes);
+        }
+        bytes
+      };
+
+      assert!(blocks_to_download.is_empty()); // TODO ?
+
+      // check hash
+      let hashed = sha1_hash(&piece);
+      if hashed != self.metainfo.pieces[downloading_piece_info.unwrap().index as usize] {
+        // bad piece: some downloaded block was not correct
+        println!("Bad piece");
+
+        // remove all downloaded pieces and move their info to the job queue
+        for block in &mut *downloading_piece {
+          // TODO: technically we don't need to download every block again
+          // all we need to do keep old blocks (one or more of them are wrong)
+          // and after downloading a block exchange the old block with the new one and check if hashes match up
+          // although, i don't think it's worth it because bad blocks are probably rare (hopefully)
+          blocks_to_download.push(block.as_ref().unwrap().info);
+          *block = None;
+        }
+      } else {
+        // good piece
+        println!("Downloaded a piece");
+
+        // write it to disk
+        self
+          .write_block(&Block {
+            bytes: piece,
+            info: BlockInfo {
+              index: downloading_piece_info.unwrap().index,
+              begin: downloading_piece_info.unwrap().begin,
+              length: downloading_piece_info.unwrap().length,
+            },
+          })
+          .await;
+
+        // mark it as downloaded
+        self.downloaded_pieces.lock().await[downloading_piece_info.unwrap().index as usize] = true;
+
+        // check if all files are downloaded
+        if self.downloaded_pieces.lock().await.iter().all(|x| *x) {
+          // download fully finished
+          println!("Download fully finished");
+          *downloading_piece_info = None;
+          // TODO: switch to seeding mode
+        } else {
+          // download not fully finished, some pieces are still left
+
+          // choose next piece
+          // TODO: add other methods like rarest first, random
+          // pick the next not downloaded piece
+          let piece_index = self
+            .downloaded_pieces
+            .lock()
+            .await
+            .iter()
+            .position(|x| *x == false)
+            .unwrap() as u32;
+
+          // get length of selected piece
+          let piece_start = piece_index * self.metainfo.piece_length;
+          let piece_length = {
+            let end = {
+              let maybe_end = piece_start + self.metainfo.piece_length;
+              let max_end = {
+                let last_file = self.files.last().unwrap();
+                last_file.offset + last_file.length
+              };
+
+              maybe_end.min(max_end)
+            };
+            end - piece_start
+          };
+          let count = (piece_length + piece_length % constants::BLOCK_SIZE) / constants::BLOCK_SIZE;
+
+          *downloading_piece = vec![];
+
+          for i in 0..count {
+            let block_start = constants::BLOCK_SIZE * i;
+            let block_end = (block_start + constants::BLOCK_SIZE).max(piece_length);
+
+            downloading_piece.push(None);
+            blocks_to_download.push(BlockInfo {
+              index: i,
+              begin: block_start,
+              length: block_end - block_start,
+            });
+          }
+
+          // set new piece info as the downloading piece info
+          *downloading_piece_info = Some(BlockInfo {
+            index: piece_index,
+            begin: piece_start,
+            length: piece_length,
+          })
+        }
+      }
+    }
   }
 
   pub async fn pause(&mut self) -> Result<()> {
