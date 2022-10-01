@@ -16,7 +16,7 @@ use crate::bytes::{encode_bytes, random_id, sha1_hash};
 use crate::constants;
 use crate::file_manager::FileManagerMessage;
 use crate::metainfo::MetaInfo;
-use crate::peer::{Block, BlockInfo, Peer};
+use crate::peer::{Block, BlockInfo, Peer, PeerMessage};
 
 pub struct Torrent {
   pub metainfo: MetaInfo,
@@ -172,7 +172,6 @@ impl Torrent {
       let listener = TcpListener::bind(format!("127.0.0.1:{}", torrent.port))
         .await
         .expect("Couldn't bind"); // TODO: remove .expect;
-      let mut interval = time::interval(Duration::from_millis(1000)); // TODO: experiment with other interval durations
       let mut choke_interval = time::interval(Duration::from_secs(10));
       let mut optimistic_unchoke_interval = time::interval(Duration::from_secs(30));
 
@@ -203,10 +202,9 @@ impl Torrent {
 
             let mut peers = torrent.peers.lock().await;
 
-            // first choke all peers
+            // first choke all peers except the optimisticly unchoked peer
             for peer in &mut *peers {
               if let Some(p) = optimistic_unchoke_peer {
-                // ignore the optimistic unchoke peer
                 if p == peer.address {
                   continue;
                 }
@@ -231,7 +229,7 @@ impl Torrent {
               if count >= constants::MAX_DOWNLOADERS { break; }
 
               if let Some(p) = optimistic_unchoke_peer {
-                // ignore the optimistic unchoke peer
+                // ignore the optimisticly unchoked peer
                 if p == peer.address {
                   continue;
                 }
@@ -257,16 +255,18 @@ impl Torrent {
               *old_peer.am_choking.lock().await = true;
             }
 
-            let mut peer_map: HashMap<SocketAddr, bool> = HashMap::new();
+            //                                  am_choking, peer_interested
+            let mut peer_map: HashMap<SocketAddr, (bool, bool)> = HashMap::new();
             for peer in &*peers {
-              peer_map.insert(peer.address, *peer.am_choking.lock().await);
+              peer_map.insert(peer.address, (*peer.am_choking.lock().await, *peer.peer_interested.lock().await));
             }
 
             // for some reason it has to be a seperate variable
             let new_unchoke = peers
-              .iter()
-              .filter(|x| Some(x.address) != optimistic_unchoke_peer && peer_map[&x.address])
+              .iter()                                                                             //  TODO: ????????????
+              .filter(|x| Some(x.address) != optimistic_unchoke_peer && peer_map[&x.address].0 && peer_map[&x.address].1)
               .choose(&mut thread_rng());
+
             if let Some(new_unchoke) = &new_unchoke {
               *new_unchoke.am_choking.lock().await = false;
               optimistic_unchoke_peer = Some(new_unchoke.address);
@@ -361,6 +361,15 @@ impl Torrent {
 
         // mark it as downloaded
         self.downloaded_pieces.lock().await[downloading_piece_info.unwrap().index as usize] = true;
+
+        // send update to peers
+        for peer in &*self.peers.lock().await {
+          peer
+            .send_message(PeerMessage::PieceDownloaded(
+              downloading_piece_info.unwrap().index,
+            ))
+            .await;
+        }
 
         // check if all files are downloaded
         if self.downloaded_pieces.lock().await.iter().all(|x| *x) {

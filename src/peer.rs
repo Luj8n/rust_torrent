@@ -8,13 +8,11 @@ use tokio::{
   io::{AsyncReadExt, AsyncWriteExt},
   net::TcpStream,
   select,
-  sync::mpsc::{self, Sender},
-  sync::Mutex,
+  sync::{mpsc::Sender, Mutex},
   time,
 };
 
 use crate::{
-  bytes::sha1_hash,
   constants::{self, MAX_ALLOWED_BLOCK_SIZE},
   torrent::{Torrent, TorrentMessage},
 };
@@ -32,9 +30,12 @@ pub struct Block {
   pub bytes: Vec<u8>,
 }
 
-// TODO: add trait Chunk and methods for it
+#[derive(Debug)]
+pub enum PeerMessage {
+  PieceDownloaded(u32), // index of piece
+}
 
-// TODO: add requests for pieces and pipelining
+// TODO: add trait Chunk and methods for it
 
 pub struct Peer {
   pub address: SocketAddr,
@@ -58,8 +59,11 @@ pub struct Peer {
 
   torrent: Weak<Torrent>,
   torrent_sender: Sender<TorrentMessage>,
+  peer_sender: Mutex<Option<Sender<PeerMessage>>>,
   peer: Weak<Peer>,
 }
+
+// FIXME: send choke, unchoke, interested, uninterested messages when their state changes!!!
 
 impl Peer {
   pub fn new(
@@ -92,17 +96,28 @@ impl Peer {
 
       torrent,
       torrent_sender,
+      peer_sender: Mutex::new(None),
       peer: me.clone(),
     })
+  }
+
+  pub async fn send_message(&self, peer_message: PeerMessage) {
+    if let Some(sender) = &*self.peer_sender.lock().await {
+      sender.send(peer_message).await.unwrap();
+    }
   }
 
   pub fn start(&self, stream: Option<TcpStream>) -> Result<()> {
     let peer = self.peer.upgrade().unwrap();
     let torrent = peer.torrent.upgrade().unwrap();
 
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PeerMessage>(32);
+
     // TODO: replace most unwraps/expects with disconnection
 
     tokio::spawn(async move {
+      *peer.peer_sender.lock().await = Some(tx);
+
       let mut stream = {
         if let Some(mut stream) = stream {
           // receive handshake
@@ -187,12 +202,60 @@ impl Peer {
       let mut one_sec_interval = time::interval(Duration::from_millis(1000));
 
       let mut requested_pieces: Vec<BlockInfo> = vec![];
+      // TODO: make the queue size dynamic
+      let queue_size = 4;
 
       let mut downloaded_from_last_second = 0;
       let mut uploaded_to_last_second = 0;
 
       'main_loop: loop {
         select! {
+          // listen to the torrent. receive piece updates (send "HAVE" message, check if interested)
+          Some(msg) = rx.recv() => {
+            use PeerMessage::*;
+            match msg {
+              PieceDownloaded(index) => {
+                // send HAVE message
+                stream.write_all(&Peer::have_message(index)).await.unwrap();
+
+                let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+                let peer_pieces = peer.piece_availability.lock().await;
+
+                assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+                let mut interested = false;
+                for i in 0..downloaded_pieces.len() {
+                  if !downloaded_pieces[i] && peer_pieces[i] {
+                    // peer has a piece that we dont have. therefore we are interested
+                    interested = true;
+                    break;
+                  }
+                }
+
+                *peer.am_interested.lock().await = interested;
+              }
+            }
+          }
+          _ = (std::future::poll_fn(|_cx| {
+            // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
+            if requested_pieces.len() < queue_size && !*peer.peer_choking.blocking_lock() && !torrent.blocks_to_download.blocking_lock().is_empty() {
+              return std::task::Poll::Ready(());
+            }
+            std::task::Poll::Pending
+          })) => {
+            let mut blocks_to_download = torrent.blocks_to_download.lock().await;
+            for i in 0..blocks_to_download.len() {
+              if peer.piece_availability.lock().await[blocks_to_download[i].index as usize] {
+                let block_info = blocks_to_download.remove(i);
+                // send request
+                stream.write_all(&Peer::request_message(block_info.index, block_info.begin, block_info.length)).await.unwrap();
+
+                requested_pieces.push(block_info);
+
+                break;
+              }
+            }
+          }
+
           Ok(_) = stream.readable() => {
             let mut length_buf = [0_u8; 4];
 
@@ -211,7 +274,7 @@ impl Peer {
 
                 // TODO: add timeout
                 match stream.read_exact(&mut buf).await {
-                  Ok(n) => {
+                  Ok(_) => {
                     let msg_id: u8 = buf[4];
 
                     match msg_id {
@@ -248,6 +311,22 @@ impl Peer {
                           .await
                           .get_mut(piece_index as usize)
                           .expect("TODO") = true;
+
+                        // check if we are interested now
+                        let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+                        let peer_pieces = peer.piece_availability.lock().await;
+
+                        assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+                        let mut interested = false;
+                        for i in 0..downloaded_pieces.len() {
+                          if !downloaded_pieces[i] && peer_pieces[i] {
+                            // peer has a piece that we dont have. therefore we are interested
+                            interested = true;
+                            break;
+                          }
+                        }
+
+                        *peer.am_interested.lock().await = interested;
                       }
                       5 => {
                         // BITFIELD

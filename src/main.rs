@@ -14,12 +14,12 @@ mod torrent;
 async fn main() {
   println!("Starting...");
 
-  let path = Path::new("torrents/test.torrent");
+  let path = Path::new("torrents/some.torrent"); // TODO: create some torrent and seed it myself
 
   let mut manager = TorrentManager::new();
 
   manager.add_torrent_from_file(path).unwrap();
-  // dbg!(manager.free_port());
+  manager.torrents[0].start_downloading(); // for checking never used functions/variables
 
   println!("Done!");
 }
