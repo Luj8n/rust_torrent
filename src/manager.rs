@@ -29,6 +29,10 @@ impl TorrentManager {
     Ok(())
   }
 
+  // pub async fn start_downloading(&self, torrent_index: usize) {
+  //   let sender = self.torrents[torrent_index].start_downloading();
+  // }
+
   pub fn add_torrent_from_file(&mut self, path: &Path) -> Result<()> {
     let bytes = from_file(path)?;
 

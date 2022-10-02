@@ -33,6 +33,8 @@ pub struct Block {
 #[derive(Debug)]
 pub enum PeerMessage {
   PieceDownloaded(u32), // index of piece
+  Choke,
+  Unchoke,
 }
 
 // TODO: add trait Chunk and methods for it
@@ -62,8 +64,6 @@ pub struct Peer {
   peer_sender: Mutex<Option<Sender<PeerMessage>>>,
   peer: Weak<Peer>,
 }
-
-// FIXME: send choke, unchoke, interested, uninterested messages when their state changes!!!
 
 impl Peer {
   pub fn new(
@@ -103,7 +103,10 @@ impl Peer {
 
   pub async fn send_message(&self, peer_message: PeerMessage) {
     if let Some(sender) = &*self.peer_sender.lock().await {
-      sender.send(peer_message).await.unwrap();
+      match sender.send(peer_message).await {
+        Ok(_) => {}
+        Err(_) => println!("Couldn't send message to peer"),
+      };
     }
   }
 
@@ -111,350 +114,409 @@ impl Peer {
     let peer = self.peer.upgrade().unwrap();
     let torrent = peer.torrent.upgrade().unwrap();
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<PeerMessage>(32);
-
-    // TODO: replace most unwraps/expects with disconnection
-
     tokio::spawn(async move {
-      *peer.peer_sender.lock().await = Some(tx);
-
-      let mut stream = {
-        if let Some(mut stream) = stream {
-          // receive handshake
-
-          let mut buf = vec![0_u8; 68];
-
-          // TODO: add timeout
-          stream.read_exact(&mut buf).await.unwrap();
-
-          let pstrlen = buf[0];
-          let pstr = &buf[1..20];
-          // let reserved = &buf[20..28];
-          let info_hash = &buf[28..48];
-          let peer_id = &buf[48..68];
-
-          assert_eq!(pstrlen, 19);
-          assert_eq!(pstr, b"BitTorrent protocol");
-          assert_eq!(info_hash, torrent.metainfo.info_hash);
-          *peer.peer_id.lock().await = Some(peer_id.try_into().unwrap());
-
-          // send handshake
-
-          stream.writable().await.unwrap();
-          stream
-            .write_all(&Peer::handshake_message(
-              &torrent.metainfo.info_hash,
-              &torrent.peer_id,
-            ))
-            .await
-            .unwrap();
-
-          stream
-        } else {
-          // TODO: add timeout
-          let mut stream = TcpStream::connect(peer.address)
-            .await
-            .expect("Couldn't connect to peer");
-
-          // send handshake
-
-          stream.writable().await.unwrap();
-          stream
-            .write_all(&Peer::handshake_message(
-              &&torrent.metainfo.info_hash,
-              &torrent.peer_id,
-            ))
-            .await
-            .unwrap();
-
-          // receive handshake
-
-          let mut buf = vec![0_u8; 68];
-
-          // TODO: add timeout
-          stream.read_exact(&mut buf).await.unwrap();
-
-          let pstrlen = buf[0];
-          let pstr = &buf[1..20];
-          // let reserved = &buf[20..28];
-          let info_hash = &buf[28..48];
-          let peer_id = &buf[48..68];
-
-          assert_eq!(pstrlen, 19);
-          assert_eq!(pstr, b"BitTorrent protocol");
-          assert_eq!(info_hash, torrent.metainfo.info_hash);
-          *peer.peer_id.lock().await = Some(peer_id.try_into().unwrap());
-
-          stream
-        }
+      match Peer::start_handler(peer.clone(), torrent.clone(), stream).await {
+        Ok(_) => println!("Peer has disconnected"),
+        Err(e) => println!(
+          "Peer has disconnected by crashing. Error: {}",
+          e.to_string()
+        ),
       };
 
-      // send bitfield
+      // disconnect peer
+      torrent.disconnect_peer(peer.address).await;
+    });
 
-      stream.writable().await.unwrap();
-      stream
-        .write_all(&Peer::bitfield_message(
-          &torrent.downloaded_pieces.lock().await,
-        ))
-        .await
-        .unwrap();
+    Ok(())
+  }
 
-      let mut one_sec_interval = time::interval(Duration::from_millis(1000));
+  async fn start_handler(
+    peer: Arc<Peer>,
+    torrent: Arc<Torrent>,
+    stream: Option<TcpStream>,
+  ) -> Result<()> {
+    println!("Added new peer");
 
-      let mut requested_pieces: Vec<BlockInfo> = vec![];
-      // TODO: make the queue size dynamic
-      let queue_size = 4;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<PeerMessage>(32);
 
-      let mut downloaded_from_last_second = 0;
-      let mut uploaded_to_last_second = 0;
+    *peer.peer_sender.lock().await = Some(tx);
 
-      'main_loop: loop {
-        select! {
-          // listen to the torrent. receive piece updates (send "HAVE" message, check if interested)
-          Some(msg) = rx.recv() => {
-            use PeerMessage::*;
-            match msg {
-              PieceDownloaded(index) => {
-                // send HAVE message
-                stream.write_all(&Peer::have_message(index)).await.unwrap();
+    // TODO: replace most unwraps/expects with "?"
 
-                let downloaded_pieces = torrent.downloaded_pieces.lock().await;
-                let peer_pieces = peer.piece_availability.lock().await;
+    let mut stream = {
+      if let Some(mut stream) = stream {
+        // receive handshake
+        println!("Receiving handshake");
 
-                assert_eq!(downloaded_pieces.len(), peer_pieces.len());
-                let mut interested = false;
-                for i in 0..downloaded_pieces.len() {
-                  if !downloaded_pieces[i] && peer_pieces[i] {
-                    // peer has a piece that we dont have. therefore we are interested
-                    interested = true;
-                    break;
-                  }
+        let mut buf = vec![0_u8; 68];
+
+        // TODO: add timeout
+        stream.read_exact(&mut buf).await?;
+
+        let pstrlen = buf[0];
+        let pstr = &buf[1..20];
+        // let reserved = &buf[20..28];
+        let info_hash = &buf[28..48];
+        let peer_id = &buf[48..68];
+
+        assert_eq!(pstrlen, 19);
+        assert_eq!(pstr, b"BitTorrent protocol");
+        assert_eq!(info_hash, torrent.metainfo.info_hash);
+        *peer.peer_id.lock().await = Some(peer_id.try_into().unwrap());
+
+        // send handshake
+        println!("Sending handshake");
+
+        stream
+          .write_all(&Peer::handshake_message(
+            &torrent.metainfo.info_hash,
+            &torrent.peer_id,
+          ))
+          .await
+          .unwrap();
+
+        stream
+      } else {
+        // TODO: add timeout
+        dbg!(peer.address);
+        let mut stream = TcpStream::connect(peer.address).await?;
+
+        // send handshake
+        println!("Sending handshake");
+
+        stream
+          .write_all(&Peer::handshake_message(
+            &torrent.metainfo.info_hash,
+            &torrent.peer_id,
+          ))
+          .await?;
+
+        // receive handshake
+        println!("Receiving handshake");
+
+        let mut buf = vec![0_u8; 68];
+
+        // TODO: add timeout
+        
+        // FIXME: i think it crashes here
+        stream.read_exact(&mut buf).await?;
+
+        let pstrlen = buf[0];
+        let pstr = &buf[1..20];
+        // let reserved = &buf[20..28];
+        let info_hash = &buf[28..48];
+        let peer_id = &buf[48..68];
+
+        assert_eq!(pstrlen, 19);
+        assert_eq!(pstr, b"BitTorrent protocol");
+        assert_eq!(info_hash, torrent.metainfo.info_hash);
+        *peer.peer_id.lock().await = Some(peer_id.try_into().unwrap());
+
+        stream
+      }
+    };
+
+    // send bitfield
+    println!("Sending bitfield");
+
+    stream
+      .write_all(&Peer::bitfield_message(
+        &torrent.downloaded_pieces.lock().await,
+      ))
+      .await
+      .unwrap();
+
+    let mut one_sec_interval = time::interval(Duration::from_millis(1000));
+
+    let mut requested_pieces: Vec<BlockInfo> = vec![];
+    // TODO: make the queue size dynamic
+    let queue_size = 4;
+
+    let mut downloaded_from_last_second = 0;
+    let mut uploaded_to_last_second = 0;
+
+    'main_loop: loop {
+      select! {
+        // listen to the torrent. receive piece updates (send "HAVE" message, check if interested)
+        Some(msg) = rx.recv() => {
+          use PeerMessage::*;
+          match msg {
+            PieceDownloaded(index) => {
+              // send HAVE message
+              stream.write_all(&Peer::have_message(index)).await.unwrap();
+
+              let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+              let peer_pieces = peer.piece_availability.lock().await;
+
+              assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+              let mut interested = false;
+              for i in 0..downloaded_pieces.len() {
+                if !downloaded_pieces[i] && peer_pieces[i] {
+                  // peer has a piece that we dont have. therefore we are interested
+                  interested = true;
+                  break;
                 }
+              }
 
+              if interested != *peer.am_interested.lock().await {
                 *peer.am_interested.lock().await = interested;
+
+                if interested {
+                  stream.write_all(&Peer::interested_message()).await.unwrap();
+                } else {
+                  stream.write_all(&Peer::not_interested_message()).await.unwrap();
+                }
+              }
+            }
+            Choke => {
+              // choke if we aren't choking
+              if !*peer.am_choking.lock().await {
+                *peer.am_choking.lock().await = true;
+
+                // send CHOKE message
+                stream.write_all(&Peer::choke_message()).await.unwrap();
+              }
+            }
+            Unchoke => {
+              // unchoke if we are choking
+              if *peer.am_choking.lock().await {
+                *peer.am_choking.lock().await = false;
+
+                // send UNCHOKE message
+                stream.write_all(&Peer::unchoke_message()).await.unwrap();
               }
             }
           }
-          _ = (std::future::poll_fn(|_cx| {
-            // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
-            if requested_pieces.len() < queue_size && !*peer.peer_choking.blocking_lock() && !torrent.blocks_to_download.blocking_lock().is_empty() {
-              return std::task::Poll::Ready(());
-            }
-            std::task::Poll::Pending
-          })) => {
-            let mut blocks_to_download = torrent.blocks_to_download.lock().await;
-            for i in 0..blocks_to_download.len() {
-              if peer.piece_availability.lock().await[blocks_to_download[i].index as usize] {
-                let block_info = blocks_to_download.remove(i);
-                // send request
-                stream.write_all(&Peer::request_message(block_info.index, block_info.begin, block_info.length)).await.unwrap();
+        }
+        _ = (std::future::poll_fn(|_cx| {
+          // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
+          if requested_pieces.len() < queue_size && !*peer.peer_choking.blocking_lock() && !torrent.blocks_to_download.blocking_lock().is_empty() {
+            return std::task::Poll::Ready(());
+          }
+          std::task::Poll::Pending
+        })) => {
+          let mut blocks_to_download = torrent.blocks_to_download.lock().await;
+          for i in 0..blocks_to_download.len() {
+            if peer.piece_availability.lock().await[blocks_to_download[i].index as usize] {
+              let block_info = blocks_to_download.remove(i);
+              // send request
+              // TODO: add timeout (5s?)
+              stream.write_all(&Peer::request_message(block_info.index, block_info.begin, block_info.length)).await.unwrap();
 
-                requested_pieces.push(block_info);
+              requested_pieces.push(block_info);
 
-                break;
-              }
+              break;
             }
           }
+        }
 
-          Ok(_) = stream.readable() => {
-            let mut length_buf = [0_u8; 4];
+        Ok(_) = stream.readable() => {
+          let mut length_buf = [0_u8; 4];
 
-            if let Ok(bytes_read) = stream.peek(&mut length_buf).await {
-              // TODO: check if this can happen
-              if bytes_read > 4 {
-                dbg!("oh");
-              }
+          if let Ok(bytes_read) = stream.peek(&mut length_buf).await {
+            // TODO: check if this can happen
+            if bytes_read > 4 {
+              dbg!("oh");
+            }
 
-              if bytes_read == 4 {
-                // successfully read first part of the message - length
 
-                let length = u32::from_be_bytes(length_buf);
+            if bytes_read == 4 {
+              println!("Peer received a message");
 
-                let mut buf = vec![0_u8; length as usize + 4];
+              // successfully read first part of the message - length
 
-                // TODO: add timeout
-                match stream.read_exact(&mut buf).await {
-                  Ok(_) => {
-                    let msg_id: u8 = buf[4];
+              let length = u32::from_be_bytes(length_buf);
 
-                    match msg_id {
-                      0 => {
-                        // CHOKE
-                        *peer.peer_choking.lock().await = true;
-                      }
-                      1 => {
-                        // UNCHOKE
-                        *peer.peer_choking.lock().await = false;
-                      }
-                      2 => {
-                        // INTERESTED
-                        *peer.peer_interested.lock().await = true;
+              let mut buf = vec![0_u8; length as usize + 4];
 
-                        // TODO: maybe don't send message
-                        peer
-                          .torrent_sender
-                          .send(TorrentMessage::InterestedPeer(peer.address))
-                          .await
-                          .unwrap();
-                      }
-                      3 => {
-                        // NOT_INTERESTED
-                        *peer.peer_interested.lock().await = false;
-                      }
-                      4 => {
-                        // HAVE
-                        let piece_index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
+              // TODO: add timeout
+              match stream.read_exact(&mut buf).await {
+                Ok(_) => {
+                  let msg_id: u8 = buf[4];
 
-                        *peer
-                          .piece_availability
-                          .lock()
-                          .await
-                          .get_mut(piece_index as usize)
-                          .expect("TODO") = true;
+                  match msg_id {
+                    0 => {
+                      // CHOKE
+                      *peer.peer_choking.lock().await = true;
+                    }
+                    1 => {
+                      // UNCHOKE
+                      *peer.peer_choking.lock().await = false;
+                    }
+                    2 => {
+                      // INTERESTED
+                      *peer.peer_interested.lock().await = true;
 
-                        // check if we are interested now
-                        let downloaded_pieces = torrent.downloaded_pieces.lock().await;
-                        let peer_pieces = peer.piece_availability.lock().await;
+                      // TODO: maybe don't send message
+                      peer
+                        .torrent_sender
+                        .send(TorrentMessage::InterestedPeer(peer.address))
+                        .await
+                        .unwrap();
+                    }
+                    3 => {
+                      // NOT_INTERESTED
+                      *peer.peer_interested.lock().await = false;
+                    }
+                    4 => {
+                      // HAVE
+                      let piece_index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
 
-                        assert_eq!(downloaded_pieces.len(), peer_pieces.len());
-                        let mut interested = false;
-                        for i in 0..downloaded_pieces.len() {
-                          if !downloaded_pieces[i] && peer_pieces[i] {
-                            // peer has a piece that we dont have. therefore we are interested
-                            interested = true;
-                            break;
-                          }
+                      *peer
+                        .piece_availability
+                        .lock()
+                        .await
+                        .get_mut(piece_index as usize)
+                        .expect("TODO") = true;
+
+                      // check if we are interested now
+                      let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+                      let peer_pieces = peer.piece_availability.lock().await;
+
+                      assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+                      let mut interested = false;
+                      for i in 0..downloaded_pieces.len() {
+                        if !downloaded_pieces[i] && peer_pieces[i] {
+                          // peer has a piece that we dont have. therefore we are interested
+                          interested = true;
+                          break;
                         }
+                      }
 
+                      if interested != *peer.am_interested.lock().await {
                         *peer.am_interested.lock().await = interested;
-                      }
-                      5 => {
-                        // BITFIELD
 
-                        let bitfield: Vec<bool> = buf[5..].iter().flat_map(|b|
-                          [
-                            b & 0b10000000 > 0,
-                            b & 0b01000000 > 0,
-                            b & 0b00100000 > 0,
-                            b & 0b00010000 > 0,
-                            b & 0b00001000 > 0,
-                            b & 0b00000100 > 0,
-                            b & 0b00000010 > 0,
-                            b & 0b00000001 > 0,
-                          ]).collect();
-
-                          let actual_len = torrent.metainfo.pieces.len();
-
-                          if actual_len < peer.piece_availability.lock().await.len() {
-                            // disconnect client
-                            break 'main_loop;
-                          }
-
-                          *peer.piece_availability.lock().await = bitfield[..actual_len].to_vec();
-                      }
-                      6 => {
-                        // REQUEST
-
-                        if *peer.am_choking.lock().await {
-                          // don't upload to choked peers
-                          continue;
+                        if interested {
+                          // send INTERESTED message
+                          stream.write_all(&Peer::interested_message()).await.unwrap();
+                        } else {
+                          // send NOT_INTERESTED message
+                          stream.write_all(&Peer::not_interested_message()).await.unwrap();
                         }
+                      }
+                    }
+                    5 => {
+                      // BITFIELD
 
-                        let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-                        let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
-                        let length = u32::from_be_bytes(buf[13..17].try_into().unwrap());
-                        if length > MAX_ALLOWED_BLOCK_SIZE {
-                          // disconnect
+                      let bitfield: Vec<bool> = buf[5..].iter().flat_map(|b|
+                        [
+                          b & 0b10000000 > 0,
+                          b & 0b01000000 > 0,
+                          b & 0b00100000 > 0,
+                          b & 0b00010000 > 0,
+                          b & 0b00001000 > 0,
+                          b & 0b00000100 > 0,
+                          b & 0b00000010 > 0,
+                          b & 0b00000001 > 0,
+                        ]).collect();
+
+                        let actual_len = torrent.metainfo.pieces.len();
+
+                        if actual_len < peer.piece_availability.lock().await.len() {
+                          // disconnect client
                           break 'main_loop;
                         }
 
-                        // i don't think it actually means to send it immediately, just when you get it. that's probably why "CANCEL" exists
-                        // TODO: find out how it actually should be
+                        *peer.piece_availability.lock().await = bitfield[..actual_len].to_vec();
+                    }
+                    6 => {
+                      // REQUEST
 
-                        let chunk = torrent.read_block(&BlockInfo { index, begin, length }).await;
-
-                        stream.write_all(&Peer::piece_message(index, begin, &chunk)).await.unwrap();
-
-                        // update bytes uploaded
-                        *peer.uploaded_to.lock().await += length;
+                      if *peer.am_choking.lock().await {
+                        // don't upload to choked peers
+                        continue;
                       }
-                      7 => {
-                        // PIECE
 
-                        if *peer.am_choking.lock().await {
-                          continue;
-                        }
-
-                        let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-                        let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
-                        let block = buf[13..].to_vec();
-
-                        if let Some(pos) = requested_pieces.iter().position(|data| data.index == index && data.begin == begin && data.length == block.len() as u32) {
-                          // only requested pieces are accepted
-
-                          let info = requested_pieces.remove(pos);
-
-                          // update bytes downloaded
-                          *peer.downloaded_from.lock().await += info.length;
-
-                          peer.torrent_sender.send(TorrentMessage::BlockDownloaded(Block { info, bytes: block })).await.unwrap();
-                        }
-                      }
-                      8 => {
-                        // CANCEL
-                        // there isn't really a use for this?
-                        // TODO
-                      }
-                      _ => {
-                        // disconnect client
+                      let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
+                      let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
+                      let length = u32::from_be_bytes(buf[13..17].try_into().unwrap());
+                      if length > MAX_ALLOWED_BLOCK_SIZE {
+                        // disconnect
                         break 'main_loop;
+                      }
 
+                      // i don't think it actually means to send it immediately, just when you get it. that's probably why "CANCEL" exists
+                      // TODO: find out how it actually should be
+
+                      let chunk = torrent.read_block(&BlockInfo { index, begin, length }).await;
+
+                      stream.write_all(&Peer::piece_message(index, begin, &chunk)).await.unwrap();
+
+                      // update bytes uploaded
+                      *peer.uploaded_to.lock().await += length;
+                    }
+                    7 => {
+                      // PIECE
+
+                      if *peer.am_choking.lock().await {
+                        continue;
+                      }
+
+                      let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
+                      let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
+                      let block = buf[13..].to_vec();
+
+                      if let Some(pos) = requested_pieces.iter().position(|data| data.index == index && data.begin == begin && data.length == block.len() as u32) {
+                        // only requested pieces are accepted
+
+                        let info = requested_pieces.remove(pos);
+
+                        // update bytes downloaded
+                        *peer.downloaded_from.lock().await += info.length;
+
+                        peer.torrent_sender.send(TorrentMessage::BlockDownloaded(Block { info, bytes: block })).await.unwrap();
                       }
                     }
+                    8 => {
+                      // CANCEL
+                      // there isn't really a use for this?
+                      // TODO
+                    }
+                    _ => {
+                      // disconnect client
+                      break 'main_loop;
+
+                    }
                   }
-                  Err(_) => {
-                    // disconnect client
-                    break 'main_loop;
-                  }
+                }
+                Err(_) => {
+                  // disconnect client
+                  break 'main_loop;
                 }
               }
             }
           }
+        }
 
-          // update stats every second
-          _ = one_sec_interval.tick() => {
-            // calculate rolling peer download/upload speed averages
-            let downloaded_from_now = *peer.downloaded_from.lock().await;
-            let uploaded_to_now = *peer.uploaded_to.lock().await;
+        // update stats every second
+        _ = one_sec_interval.tick() => {
+          // calculate rolling peer download/upload speed averages
+          let downloaded_from_now = *peer.downloaded_from.lock().await;
+          let uploaded_to_now = *peer.uploaded_to.lock().await;
 
-            let download_delta = downloaded_from_now - downloaded_from_last_second;
-            let upload_delta = uploaded_to_now - uploaded_to_last_second;
+          let download_delta = downloaded_from_now - downloaded_from_last_second;
+          let upload_delta = uploaded_to_now - uploaded_to_last_second;
 
-            let mut rolling_download = peer.rolling_download.lock().await;
-            let mut rolling_upload = peer.rolling_upload.lock().await;
+          let mut rolling_download = peer.rolling_download.lock().await;
+          let mut rolling_upload = peer.rolling_upload.lock().await;
 
-            rolling_download.insert(0, download_delta);
-            rolling_upload.insert(0, upload_delta);
+          rolling_download.insert(0, download_delta);
+          rolling_upload.insert(0, upload_delta);
 
-            rolling_download.truncate(constants::ROLLING_AVERAGE_SIZE as usize);
-            rolling_upload.truncate(constants::ROLLING_AVERAGE_SIZE as usize);
+          rolling_download.truncate(constants::ROLLING_AVERAGE_SIZE as usize);
+          rolling_upload.truncate(constants::ROLLING_AVERAGE_SIZE as usize);
 
-            *peer.downloaded_from_rate.lock().await = rolling_download.iter().sum::<u32>() / rolling_download.len() as u32;
-            *peer.uploaded_to_rate.lock().await = rolling_upload.iter().sum::<u32>() / rolling_upload.len() as u32;
+          *peer.downloaded_from_rate.lock().await = rolling_download.iter().sum::<u32>() / rolling_download.len() as u32;
+          *peer.uploaded_to_rate.lock().await = rolling_upload.iter().sum::<u32>() / rolling_upload.len() as u32;
 
-            downloaded_from_last_second = downloaded_from_now;
-            uploaded_to_last_second = uploaded_to_now;
-          }
-        };
-      }
+          println!("Download rate: {}", *peer.downloaded_from_rate.lock().await / (1024 * 1024));
+          println!("Upload rate: {}", *peer.uploaded_to_rate.lock().await / (1024 * 1024));
 
-      // want to disconnect, send message to torrent manager
-      peer
-        .torrent_sender
-        .send(TorrentMessage::DisconnectPeer(peer.address))
-        .await
-        .unwrap();
-    });
+          downloaded_from_last_second = downloaded_from_now;
+          uploaded_to_last_second = uploaded_to_now;
+        }
+      };
+    }
 
     Ok(())
   }
@@ -468,10 +530,14 @@ impl Peer {
     msg.extend(info_hash); // info_hash
     msg.extend(peer_id); // peer_id
 
+    assert_eq!(msg.len(), 68);
+
     msg
   }
 
   pub fn choke_message() -> Vec<u8> {
+    println!("Sending choke_message");
+
     let mut msg = vec![];
 
     msg.extend(1_u32.to_be_bytes()); // length
@@ -481,6 +547,8 @@ impl Peer {
   }
 
   pub fn unchoke_message() -> Vec<u8> {
+    println!("Sending unchoke_message");
+
     let mut msg = vec![];
 
     msg.extend(1_u32.to_be_bytes()); // length
@@ -490,6 +558,8 @@ impl Peer {
   }
 
   pub fn interested_message() -> Vec<u8> {
+    println!("Sending interested_message");
+
     let mut msg = vec![];
 
     msg.extend(1_u32.to_be_bytes()); // length
@@ -499,6 +569,8 @@ impl Peer {
   }
 
   pub fn not_interested_message() -> Vec<u8> {
+    println!("Sending not_interested_message");
+
     let mut msg = vec![];
 
     msg.extend(1_u32.to_be_bytes()); // length
@@ -508,6 +580,8 @@ impl Peer {
   }
 
   pub fn have_message(piece_index: u32) -> Vec<u8> {
+    println!("Sending have_message");
+
     let mut msg = vec![];
 
     msg.extend(5_u32.to_be_bytes()); // length
@@ -518,6 +592,8 @@ impl Peer {
   }
 
   pub fn bitfield_message(bitfield: &[bool]) -> Vec<u8> {
+    println!("Sending bitfield_message");
+
     let mut msg = vec![];
 
     let field: Vec<u8> = bitfield
@@ -542,6 +618,8 @@ impl Peer {
   }
 
   pub fn request_message(piece_index: u32, begin: u32, length: u32) -> Vec<u8> {
+    println!("Sending request_message");
+
     let mut msg = vec![];
 
     msg.extend(13_u32.to_be_bytes()); // length
@@ -554,6 +632,8 @@ impl Peer {
   }
 
   pub fn piece_message(piece_index: u32, begin: u32, block: &[u8]) -> Vec<u8> {
+    println!("Sending piece_message");
+
     let mut msg = vec![];
 
     msg.extend((9_u32 + block.len() as u32).to_be_bytes()); // length
@@ -565,7 +645,10 @@ impl Peer {
     msg
   }
 
+  // TODO: find out what to do with this
   pub fn cancel_message(piece_index: u32, begin: u32, length: u32) -> Vec<u8> {
+    println!("Sending cancel_message");
+
     let mut msg = vec![];
 
     msg.extend(13_u32.to_be_bytes()); // length

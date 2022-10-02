@@ -26,15 +26,16 @@ pub fn random_id() -> [u8; 20] {
   bytes
 }
 
-pub fn random_bytes() -> [u8; 20] {
-  let mut bytes = [0; 20];
-  thread_rng().fill(&mut bytes);
-  bytes
-}
+// pub fn random_bytes() -> [u8; 20] {
+//   let mut bytes = [0; 20];
+//   thread_rng().fill(&mut bytes);
+//   bytes
+// }
 
 pub fn encode_bytes(bytes: &[u8]) -> String {
   urlencoding::encode_binary(bytes).to_string()
-
+  
+  // TODO: check if this implementation is correct
   // let mut out: String = "".to_string();
   // for b in bytes {
   //   match *b as char {
@@ -46,26 +47,26 @@ pub fn encode_bytes(bytes: &[u8]) -> String {
   // out
 }
 
-pub fn bytes_to_hexadecimal(bytes: &[u8]) -> String {
-  // returns in uppercase
-  bytes
-    .iter()
-    .flat_map(|b| {
-      [
-        nibble_to_hexadeximal(b >> 4),
-        nibble_to_hexadeximal(b & 0b1111),
-      ]
-    })
-    .collect()
-}
+// pub fn bytes_to_hexadecimal(bytes: &[u8]) -> String {
+//   // returns in uppercase
+//   bytes
+//     .iter()
+//     .flat_map(|b| {
+//       [
+//         nibble_to_hexadeximal(b >> 4),
+//         nibble_to_hexadeximal(b & 0b1111),
+//       ]
+//     })
+//     .collect()
+// }
 
-fn nibble_to_hexadeximal(nibble: u8) -> char {
-  match nibble {
-    0..=9 => (nibble + 48) as char,
-    10..=15 => (nibble - 10 + 65) as char,
-    _ => panic!("Not a nibble"),
-  }
-}
+// fn nibble_to_hexadeximal(nibble: u8) -> char {
+//   match nibble {
+//     0..=9 => (nibble + 48) as char,
+//     10..=15 => (nibble - 10 + 65) as char,
+//     _ => panic!("Not a nibble"),
+//   }
+// }
 
 pub fn from_file(path: &Path) -> Result<Vec<u8>> {
   let mut file = std::fs::File::open(path)?;

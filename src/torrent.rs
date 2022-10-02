@@ -35,6 +35,8 @@ pub struct Torrent {
 
   downloading_piece_info: Mutex<Option<BlockInfo>>,
   downloading_piece: Mutex<Vec<Option<Block>>>,
+
+  optimistic_unchoke_peer: Mutex<Option<SocketAddr>>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +76,7 @@ pub struct FileInfo {
 #[derive(Debug)]
 pub enum TorrentMessage {
   BlockDownloaded(Block),
-  DisconnectPeer(SocketAddr),
+  // DisconnectPeer(SocketAddr),
   InterestedPeer(SocketAddr),
 }
 
@@ -153,10 +155,14 @@ impl Torrent {
 
       downloading_piece_info: Mutex::new(None),
       downloading_piece: Mutex::new(vec![]),
+
+      optimistic_unchoke_peer: Mutex::new(None),
     }))
   }
 
   pub fn start_downloading(&self) -> Sender<TorrentMessage> {
+    println!("Starting the download");
+
     let torrent = self.torrent.upgrade().unwrap();
 
     let (tx, mut rx) = mpsc::channel::<TorrentMessage>(32);
@@ -166,23 +172,31 @@ impl Torrent {
     tokio::spawn(async move {
       // TODO: move hash checking somewhere else
       // check hash, set downloaded pieces
+      println!("Checking torrent hash");
       let good_pieces = torrent.check_whole_hash().await;
       *torrent.downloaded_pieces.lock().await = good_pieces;
 
+      println!("Starting to listen for new peers");
       let listener = TcpListener::bind(format!("127.0.0.1:{}", torrent.port))
         .await
         .expect("Couldn't bind"); // TODO: remove .expect;
       let mut choke_interval = time::interval(Duration::from_secs(10));
       let mut optimistic_unchoke_interval = time::interval(Duration::from_secs(30));
 
+      println!("Contacting the tracker");
       let first_tracker_response = torrent
         .request_tracker(Some(TrackerEvent::Started), None)
         .await
         .expect("Couldn't request tracker"); // TODO: remove .expect
 
+      dbg!(&first_tracker_response);
+      println!("Our port = {}", torrent.port);
+
+      println!("Adding peers");
       let peers: Vec<Arc<Peer>> = first_tracker_response
         .peer_info
         .iter()
+        .filter(|a| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), torrent.port) != **a)
         .map(|a| Peer::new(*a, Arc::downgrade(&torrent), tx.clone()))
         .collect();
 
@@ -192,67 +206,26 @@ impl Torrent {
 
       *torrent.peers.lock().await = peers;
 
-      let mut unchoked_peers: Vec<SocketAddr> = vec![];
-      let mut optimistic_unchoke_peer: Option<SocketAddr> = None;
+      torrent.choose_first_piece().await;
 
       loop {
         select! {
           _ = choke_interval.tick() => {
-            // choke and unchoke selected peers
-
-            let mut peers = torrent.peers.lock().await;
-
-            // first choke all peers except the optimisticly unchoked peer
-            for peer in &mut *peers {
-              if let Some(p) = optimistic_unchoke_peer {
-                if p == peer.address {
-                  continue;
-                }
-              }
-              *peer.am_choking.lock().await = true;
-            }
-
-            // workaround because can't sort with an async function
-            let mut peer_map: HashMap<SocketAddr, u32> = HashMap::new();
-            for peer in &*peers {
-              peer_map.insert(peer.address, *peer.downloaded_from_rate.lock().await);
-            }
-
-            // peers are rated by their rolling upload average
-            // TODO: when seeding (100% downloaded torrent) they should be rated by their download rate
-            peers.sort_by_key(|x| peer_map[&x.address]);
-            peers.reverse(); // the best peers should be first
-
-            let mut count = 0;
-            // unchoke best peers
-            for peer in &mut *peers {
-              if count >= constants::MAX_DOWNLOADERS { break; }
-
-              if let Some(p) = optimistic_unchoke_peer {
-                // ignore the optimisticly unchoked peer
-                if p == peer.address {
-                  continue;
-                }
-              }
-
-              if *peer.peer_interested.lock().await {
-                count += 1;
-                *peer.am_choking.lock().await = false;
-              } else {
-                // TODO: Peers which have a better upload rate (as compared to the downloaders) but aren't interested get unchoked.
-                // If they become interested, the downloader with the worst upload rate gets choked.
-              }
-            }
+            torrent.regular_unchoke().await;
           }
           _ = optimistic_unchoke_interval.tick() => {
+            println!("Optimistically unchoking a peer");
+
             // optimistically unchoke a random peer
             // TODO: add bias (3x) to new peers
 
+            let mut optimistic_unchoke_peer = torrent.optimistic_unchoke_peer.lock().await;
+
             let peers = torrent.peers.lock().await;
 
-            // choke old optimistic unchoke peer
-            if let Some(old_peer) = peers.iter().find(|x| Some(x.address) == optimistic_unchoke_peer) {
-              *old_peer.am_choking.lock().await = true;
+            // choke the old optimistically unchoked peer
+            if let Some(old_peer) = peers.iter().find(|x| Some(x.address) == *optimistic_unchoke_peer) {
+              old_peer.send_message(PeerMessage::Choke).await;
             }
 
             //                                  am_choking, peer_interested
@@ -263,23 +236,27 @@ impl Torrent {
 
             // for some reason it has to be a seperate variable
             let new_unchoke = peers
-              .iter()                                                                             //  TODO: ????????????
-              .filter(|x| Some(x.address) != optimistic_unchoke_peer && peer_map[&x.address].0 && peer_map[&x.address].1)
+              .iter()
+              .filter(|x| Some(x.address) != *optimistic_unchoke_peer && peer_map[&x.address].0) //  TODO: && peer_map[&x.address].1 ???
               .choose(&mut thread_rng());
 
             if let Some(new_unchoke) = &new_unchoke {
-              *new_unchoke.am_choking.lock().await = false;
-              optimistic_unchoke_peer = Some(new_unchoke.address);
+              // unchoke the new optimistically unchoked peer
+              new_unchoke.send_message(PeerMessage::Unchoke).await;
+
+              *optimistic_unchoke_peer = Some(new_unchoke.address);
             } else {
-              optimistic_unchoke_peer = None;
+              *optimistic_unchoke_peer = None;
             }
           }
 
           // listen for new peers joining
           Ok((stream, socket)) = listener.accept() => {
-              let new_peer = Peer::new(socket, Arc::downgrade(&torrent), tx.clone());
-              new_peer.start(Some(stream)).unwrap();
-              torrent.peers.lock().await.push(new_peer);
+            println!("New peer joined");
+
+            let new_peer = Peer::new(socket, Arc::downgrade(&torrent), tx.clone());
+            new_peer.start(Some(stream)).unwrap();
+            torrent.peers.lock().await.push(new_peer);
           }
 
           // an mpsc channel to listen for peer updates and update their stats
@@ -287,18 +264,30 @@ impl Torrent {
             use TorrentMessage::*;
             match msg {
               BlockDownloaded(block) => {
+                println!("Block downloaded");
+
                 let index = block.info.index;
                 torrent.downloading_piece.lock().await[index as usize] = Some(block);
 
                 // check if piece is finished
                 torrent.try_choose_new_piece().await;
               }
-              DisconnectPeer(address) => {
-                torrent.peers.lock().await.retain(|x| x.address != address);
-              }
-              InterestedPeer(address) => {
-                // TODO: Peers which have a better upload rate (as compared to the downloaders) but aren't interested get unchoked.
-                // If they become *interested*, the downloader with the worst upload rate gets choked.
+              // DisconnectPeer(address) => {
+              //   torrent.peers.lock().await.retain(|x| x.address != address);
+
+              //   // run regular unchoke algorithm
+              //   torrent.regular_unchoke().await;
+              //   // reset regular unchoke timer
+              //   choke_interval.reset();
+              // }
+              InterestedPeer(_) => {
+                // Peers which have a better upload rate (as compared to the downloaders) but aren't interested get unchoked.
+                // If they become interested, the regular unchoke algorithm is run
+
+                // run regular unchoke algorithm
+                torrent.regular_unchoke().await;
+                // reset regular unchoke timer
+                choke_interval.reset();
               }
             }
           }
@@ -310,12 +299,127 @@ impl Torrent {
     tx_clone
   }
 
+  pub async fn disconnect_peer(&self, address: SocketAddr) {
+    self.peers.lock().await.retain(|x| x.address != address);
+
+    // run regular unchoke algorithm
+    self.regular_unchoke().await;
+
+    // TODO: reset interval
+  }
+
+  async fn regular_unchoke(&self) {
+    println!("Running regular unchoke algorithm");
+
+    let mut peers = self.peers.lock().await;
+
+    // workaround because can't sort with an async function
+    let mut peer_map: HashMap<SocketAddr, u32> = HashMap::new();
+    println!("");
+    println!("--------------------------");
+    println!("Currently connected peers:");
+    for peer in &*peers {
+      println!("{}", peer.address);
+      peer_map.insert(peer.address, *peer.downloaded_from_rate.lock().await);
+    }
+    println!("--------------------------");
+    println!("");
+
+    // peers are rated by their rolling upload average
+    // TODO: when seeding (100% downloaded torrent) they should be rated by their download rate
+    peers.sort_by_key(|x| peer_map[&x.address]);
+    peers.reverse(); // the best peers should be first
+
+    let mut count = 0;
+    // unchoke best peers
+    for peer in &mut *peers {
+      if peer_map[&peer.address] == 0 {
+        // choke bad peers. they will only be unchoked optimistically
+        peer.send_message(PeerMessage::Choke).await;
+
+        continue;
+      }
+
+      if count >= constants::MAX_DOWNLOADERS {
+        break;
+      }
+
+      if let Some(p) = *self.optimistic_unchoke_peer.lock().await {
+        // ignore the optimistically unchoked peer
+        if p == peer.address {
+          continue;
+        }
+      }
+
+      if *peer.peer_interested.lock().await {
+        // unchoke
+        count += 1;
+        peer.send_message(PeerMessage::Unchoke).await;
+      } else {
+        // Peers which have a better upload rate (as compared to the downloaders) but aren't interested get unchoked.
+        // If they become interested, this algorithm is rerun
+        peer.send_message(PeerMessage::Unchoke).await;
+      }
+    }
+  }
+
+  async fn choose_first_piece(&self) {
+    println!("Choosing first piece");
+
+    let mut downloading_piece = self.downloading_piece.lock().await;
+    let mut downloading_piece_info = self.downloading_piece_info.lock().await;
+    let mut blocks_to_download = self.blocks_to_download.lock().await;
+
+    // TODO: check if there are no pieces?
+
+    let piece_index = 0; // TODO
+
+    // get length of selected piece
+    let piece_start = piece_index * self.metainfo.piece_length;
+    let piece_length = {
+      let end = {
+        let maybe_end = piece_start + self.metainfo.piece_length;
+        let max_end = {
+          let last_file = self.files.last().unwrap();
+          last_file.offset + last_file.length
+        };
+
+        maybe_end.min(max_end)
+      };
+      end - piece_start
+    };
+    let count = (piece_length + piece_length % constants::BLOCK_SIZE) / constants::BLOCK_SIZE;
+
+    *downloading_piece = vec![];
+
+    for i in 0..count {
+      let block_start = constants::BLOCK_SIZE * i;
+      let block_end = (block_start + constants::BLOCK_SIZE).max(piece_length);
+
+      downloading_piece.push(None);
+      blocks_to_download.push(BlockInfo {
+        index: i,
+        begin: block_start,
+        length: block_end - block_start,
+      });
+    }
+
+    // set new piece info as the downloading piece info
+    *downloading_piece_info = Some(BlockInfo {
+      index: piece_index,
+      begin: piece_start,
+      length: piece_length,
+    })
+  }
+
   async fn try_choose_new_piece(&self) {
     let mut downloading_piece = self.downloading_piece.lock().await;
     let mut downloading_piece_info = self.downloading_piece_info.lock().await;
 
     // check if the piece, which is currently being downloaded, has completely downloaded
     if downloading_piece.iter().all(|x| x.is_some()) && downloading_piece_info.is_some() {
+      println!("Choosing new piece");
+
       let mut blocks_to_download = self.blocks_to_download.lock().await;
 
       let piece: Vec<u8> = {
@@ -487,7 +591,7 @@ impl Torrent {
     hashed == self.metainfo.pieces[piece_index as usize]
   }
 
-  async fn check_whole_hash(&self) -> Vec<bool> {
+  pub async fn check_whole_hash(&self) -> Vec<bool> {
     let mut v = vec![];
 
     for i in 0..self.metainfo.pieces.len() {

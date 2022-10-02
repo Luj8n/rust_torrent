@@ -33,8 +33,6 @@ impl FileManager {
       while let Some(message) = rx.recv().await {
         use FileManagerMessage::*;
 
-        // println!("Got message = {message:?}");
-
         match message {
           Write {
             bytes,
@@ -54,14 +52,14 @@ impl FileManager {
 
             let mut bytes = vec![0; length as usize];
 
-            let bytes_read = file.read_at(&mut bytes, offset as u64).unwrap();
-
-            // assert_eq!(length, bytes_read as u32);
+            file.read_at(&mut bytes, offset as u64).unwrap();
 
             sender.send(bytes).unwrap();
           }
         };
       }
+
+      println!("File manager thread is done");
     });
 
     FileManager { sender: tx }
