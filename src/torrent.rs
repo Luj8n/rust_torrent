@@ -208,14 +208,14 @@ impl Torrent {
 
       torrent.choose_first_piece().await;
 
+      torrent.alert_peers_updated_job_queue().await;
+
       loop {
         select! {
           _ = choke_interval.tick() => {
             torrent.regular_unchoke().await;
           }
           _ = optimistic_unchoke_interval.tick() => {
-            println!("Optimistically unchoking a peer");
-
             // optimistically unchoke a random peer
             // TODO: add bias (3x) to new peers
 
@@ -245,6 +245,8 @@ impl Torrent {
               new_unchoke.send_message(PeerMessage::Unchoke).await;
 
               *optimistic_unchoke_peer = Some(new_unchoke.address);
+
+              println!("Optimistically unchoked {}. True? = {}", new_unchoke.address, new_unchoke.am_choking.lock().await);
             } else {
               *optimistic_unchoke_peer = None;
             }
@@ -319,7 +321,14 @@ impl Torrent {
     println!("--------------------------");
     println!("Currently connected peers:");
     for peer in &*peers {
-      println!("{}", peer.address);
+      println!(
+        "{}, am_choking={}, am_interested={}, peer_choking={}, peer_interested={}",
+        peer.address,
+        peer.am_choking.lock().await,
+        peer.am_interested.lock().await,
+        peer.peer_choking.lock().await,
+        peer.peer_interested.lock().await,
+      );
       peer_map.insert(peer.address, *peer.downloaded_from_rate.lock().await);
     }
     println!("--------------------------");
@@ -410,6 +419,13 @@ impl Torrent {
       begin: piece_start,
       length: piece_length,
     })
+  }
+
+  pub async fn alert_peers_updated_job_queue(&self) {
+    let peers = self.peers.lock().await;
+    for peer in &*peers {
+      peer.send_message(PeerMessage::UpdatedJobQueue).await;
+    }
   }
 
   async fn try_choose_new_piece(&self) {

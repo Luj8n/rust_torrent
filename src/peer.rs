@@ -17,7 +17,7 @@ use crate::{
   torrent::{Torrent, TorrentMessage},
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockInfo {
   pub index: u32, // piece index
   pub begin: u32, // offset
@@ -35,9 +35,13 @@ pub enum PeerMessage {
   PieceDownloaded(u32), // index of piece
   Choke,
   Unchoke,
+  RequestPiece(BlockInfo),
+  UpdatedJobQueue,
 }
 
 // TODO: add trait Chunk and methods for it
+
+// FIXME: select in a loop is not working correctly. interval branch is not being executed.
 
 pub struct Peer {
   pub address: SocketAddr,
@@ -58,6 +62,7 @@ pub struct Peer {
   pub uploaded_to_rate: Mutex<u32>,     // rolling average, updated every second
 
   pub piece_availability: Mutex<Vec<bool>>,
+  requested_blocks: Mutex<Vec<BlockInfo>>,
 
   torrent: Weak<Torrent>,
   torrent_sender: Sender<TorrentMessage>,
@@ -93,6 +98,7 @@ impl Peer {
         false;
         torrent.clone().upgrade().unwrap().metainfo.pieces.len()
       ]),
+      requested_blocks: Mutex::new(vec![]),
 
       torrent,
       torrent_sender,
@@ -128,6 +134,68 @@ impl Peer {
     });
 
     Ok(())
+  }
+
+  async fn try_update_job_queue(peer: Arc<Peer>, torrent: Arc<Torrent>) {
+    println!("Trying to update job queue");
+
+    // TODO: make the queue size dynamic
+    let queue_size = 3;
+
+    // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
+    println!(
+      "Requested blocks = {}, peer is choking us = {}, there is no blocks to download = {}",
+      peer.requested_blocks.lock().await.len(),
+      peer.peer_choking.lock().await,
+      torrent.blocks_to_download.lock().await.is_empty()
+    );
+
+    if peer.requested_blocks.lock().await.len() >= queue_size
+      || *peer.peer_choking.lock().await
+      || torrent.blocks_to_download.lock().await.is_empty()
+    {
+      return;
+    }
+
+    println!("Trying to find block to request");
+
+    let piece_availability = peer.piece_availability.lock().await;
+    let mut blocks_to_download = torrent.blocks_to_download.lock().await;
+
+    for i in 0..blocks_to_download.len() {
+      if piece_availability[blocks_to_download[i].index as usize] {
+        let block_info = blocks_to_download.remove(i);
+        // send request
+        peer.requested_blocks.lock().await.push(block_info);
+
+        peer
+          .send_message(PeerMessage::RequestPiece(block_info))
+          .await;
+
+        let peer = peer.clone();
+        let torrent = torrent.clone();
+
+        // after some time check if the block was downloaded
+        Peer::create_request_timeout(peer, torrent, block_info);
+        break;
+      }
+    }
+  }
+
+  fn create_request_timeout(peer: Arc<Peer>, torrent: Arc<Torrent>, block_info: BlockInfo) {
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_secs(5)).await;
+
+      let mut requested_blocks = peer.requested_blocks.lock().await;
+
+      if let Some(pos) = requested_blocks.iter().position(|x| *x == block_info) {
+        requested_blocks.remove(pos);
+
+        torrent.blocks_to_download.lock().await.push(block_info);
+
+        torrent.alert_peers_updated_job_queue().await;
+      }
+    });
   }
 
   async fn start_handler(
@@ -197,8 +265,7 @@ impl Peer {
         let mut buf = vec![0_u8; 68];
 
         // TODO: add timeout
-        
-        // FIXME: i think it crashes here
+
         stream.read_exact(&mut buf).await?;
 
         let pstrlen = buf[0];
@@ -227,10 +294,6 @@ impl Peer {
       .unwrap();
 
     let mut one_sec_interval = time::interval(Duration::from_millis(1000));
-
-    let mut requested_pieces: Vec<BlockInfo> = vec![];
-    // TODO: make the queue size dynamic
-    let queue_size = 4;
 
     let mut downloaded_from_last_second = 0;
     let mut uploaded_to_last_second = 0;
@@ -262,15 +325,23 @@ impl Peer {
                 *peer.am_interested.lock().await = interested;
 
                 if interested {
+                  println!("Interested in {}", peer.address);
+
                   stream.write_all(&Peer::interested_message()).await.unwrap();
                 } else {
+                  println!("Not interested in {}", peer.address);
+
                   stream.write_all(&Peer::not_interested_message()).await.unwrap();
                 }
               }
+
+              Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
             }
             Choke => {
               // choke if we aren't choking
               if !*peer.am_choking.lock().await {
+                println!("Choking {}", peer.address);
+
                 *peer.am_choking.lock().await = true;
 
                 // send CHOKE message
@@ -280,32 +351,25 @@ impl Peer {
             Unchoke => {
               // unchoke if we are choking
               if *peer.am_choking.lock().await {
+                println!("Unchoking {}", peer.address);
+
                 *peer.am_choking.lock().await = false;
 
                 // send UNCHOKE message
                 stream.write_all(&Peer::unchoke_message()).await.unwrap();
               }
             }
-          }
-        }
-        _ = (std::future::poll_fn(|_cx| {
-          // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
-          if requested_pieces.len() < queue_size && !*peer.peer_choking.blocking_lock() && !torrent.blocks_to_download.blocking_lock().is_empty() {
-            return std::task::Poll::Ready(());
-          }
-          std::task::Poll::Pending
-        })) => {
-          let mut blocks_to_download = torrent.blocks_to_download.lock().await;
-          for i in 0..blocks_to_download.len() {
-            if peer.piece_availability.lock().await[blocks_to_download[i].index as usize] {
-              let block_info = blocks_to_download.remove(i);
-              // send request
-              // TODO: add timeout (5s?)
-              stream.write_all(&Peer::request_message(block_info.index, block_info.begin, block_info.length)).await.unwrap();
+            RequestPiece(block_info) => {
+              println!("Requesting block of piece n.{} from {}", block_info.index, peer.address);
 
-              requested_pieces.push(block_info);
-
-              break;
+              stream.write_all(&Peer::request_message(
+                block_info.index,
+                block_info.begin,
+                block_info.length,
+              )).await.unwrap();
+            }
+            UpdatedJobQueue => {
+              Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
             }
           }
         }
@@ -338,10 +402,14 @@ impl Peer {
                     0 => {
                       // CHOKE
                       *peer.peer_choking.lock().await = true;
+
+                      Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
                     }
                     1 => {
                       // UNCHOKE
                       *peer.peer_choking.lock().await = false;
+
+                      Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
                     }
                     2 => {
                       // INTERESTED
@@ -456,15 +524,27 @@ impl Peer {
                       let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
                       let block = buf[13..].to_vec();
 
-                      if let Some(pos) = requested_pieces.iter().position(|data| data.index == index && data.begin == begin && data.length == block.len() as u32) {
-                        // only requested pieces are accepted
+                      let sent_block = Block {
+                        info: BlockInfo {
+                          index,
+                          begin,
+                          length: block.len() as u32,
+                        },
+                        bytes: block,
+                      };
 
-                        let info = requested_pieces.remove(pos);
+                      let mut requested_blocks = peer.requested_blocks.lock().await;
+
+                      if let Some(pos) = requested_blocks.iter().position(|data| *data == sent_block.info) {
+                        // only requested pieces are accepted
+                        requested_blocks.remove(pos);
 
                         // update bytes downloaded
-                        *peer.downloaded_from.lock().await += info.length;
+                        *peer.downloaded_from.lock().await += sent_block.info.length;
 
-                        peer.torrent_sender.send(TorrentMessage::BlockDownloaded(Block { info, bytes: block })).await.unwrap();
+                        peer.torrent_sender.send(TorrentMessage::BlockDownloaded(sent_block)).await.unwrap();
+
+                        Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
                       }
                     }
                     8 => {

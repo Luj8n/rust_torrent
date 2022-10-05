@@ -40,8 +40,8 @@ impl TorrentManager {
   }
 
   pub fn free_port(&self) -> Result<u16> {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    Ok(listener.local_addr()?.port())
+    // let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Ok(listener.local_addr()?.port())
+    Ok(5461)
   }
 }
