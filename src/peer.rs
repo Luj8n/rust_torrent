@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::{
   net::SocketAddr,
   sync::{Arc, Weak},
@@ -17,6 +17,81 @@ use crate::{
   torrent::{Torrent, TorrentMessage},
 };
 
+struct PeerMessageReader {
+  length_buf: [u8; 4],
+  length_buf_len: usize,
+
+  message_buf: Vec<u8>,
+  message_buf_len: usize,
+}
+
+impl PeerMessageReader {
+  fn new() -> Self {
+    PeerMessageReader {
+      length_buf: [0_u8; 4],
+      length_buf_len: 0,
+      message_buf: vec![],
+      message_buf_len: 0,
+    }
+  }
+  // in general, if a future is dropped, it stops executing at a .await
+  // therefore, this function should be cancel safe
+  async fn next(&mut self, stream: &mut TcpStream) -> Result<PeerMessage> {
+    loop {
+      if self.message_buf_len != 0 {
+        let bytes_read = stream
+          .read(&mut self.message_buf[self.message_buf_len..])
+          .await?;
+        self.message_buf_len += bytes_read;
+
+        if self.message_buf_len == self.message_buf.len() {
+          let peer_message = PeerMessage::from_bytes(&self.message_buf)
+            .ok_or(anyhow!("Couldn't parse peer message"))?;
+
+          self.message_buf_len = 0;
+          return Ok(peer_message);
+        }
+      }
+
+      let bytes_read = stream
+        .read(&mut self.length_buf[self.length_buf_len..])
+        .await?;
+      self.length_buf_len += bytes_read;
+
+      if self.length_buf_len == 4 {
+        self.length_buf_len = 0;
+        self.message_buf_len = 0;
+        self.message_buf = vec![0; u32::from_be_bytes(self.length_buf) as usize];
+      }
+    }
+  }
+}
+
+enum PeerMessage {
+  Choke,
+  Unchoke,
+  Intersted,
+  NotInterested,
+  Have(u32),
+  Bitfield(Vec<bool>),
+  Request(BlockInfo),
+  Piece(Block),
+  Cancel(BlockInfo),
+}
+
+impl PeerMessage {
+  fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    let id = bytes.get(0)?;
+
+    // TODO: here
+    match id {
+      _ => {}
+    }
+
+    todo!()
+  }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockInfo {
   pub index: u32, // piece index
@@ -31,15 +106,13 @@ pub struct Block {
 }
 
 #[derive(Debug)]
-pub enum PeerMessage {
+pub enum ClientMessage {
   PieceDownloaded(u32), // index of piece
   Choke,
   Unchoke,
   RequestPiece(BlockInfo),
   UpdatedJobQueue,
 }
-
-// TODO: add trait Chunk and methods for it
 
 // FIXME: select in a loop is not working correctly. interval branch is not being executed.
 
@@ -66,7 +139,7 @@ pub struct Peer {
 
   torrent: Weak<Torrent>,
   torrent_sender: Sender<TorrentMessage>,
-  peer_sender: Mutex<Option<Sender<PeerMessage>>>,
+  peer_sender: Mutex<Option<Sender<ClientMessage>>>,
   peer: Weak<Peer>,
 }
 
@@ -107,7 +180,7 @@ impl Peer {
     })
   }
 
-  pub async fn send_message(&self, peer_message: PeerMessage) {
+  pub async fn send_message(&self, peer_message: ClientMessage) {
     if let Some(sender) = &*self.peer_sender.lock().await {
       match sender.send(peer_message).await {
         Ok(_) => {}
@@ -169,7 +242,7 @@ impl Peer {
         peer.requested_blocks.lock().await.push(block_info);
 
         peer
-          .send_message(PeerMessage::RequestPiece(block_info))
+          .send_message(ClientMessage::RequestPiece(block_info))
           .await;
 
         let peer = peer.clone();
@@ -205,7 +278,7 @@ impl Peer {
   ) -> Result<()> {
     println!("Added new peer");
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<PeerMessage>(32);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ClientMessage>(32);
 
     *peer.peer_sender.lock().await = Some(tx);
 
@@ -298,11 +371,13 @@ impl Peer {
     let mut downloaded_from_last_second = 0;
     let mut uploaded_to_last_second = 0;
 
+    let mut peer_message_reader = PeerMessageReader::new();
+
     'main_loop: loop {
       select! {
         // listen to the torrent. receive piece updates (send "HAVE" message, check if interested)
         Some(msg) = rx.recv() => {
-          use PeerMessage::*;
+          use ClientMessage::*;
           match msg {
             PieceDownloaded(index) => {
               // send HAVE message
@@ -374,7 +449,9 @@ impl Peer {
           }
         }
 
-        Ok(_) = stream.readable() => {
+        Ok(peer_message) = peer_message_reader.next(&mut stream) => {
+          // TODO: here
+
           let mut length_buf = [0_u8; 4];
 
           if let Ok(bytes_read) = stream.peek(&mut length_buf).await {
@@ -382,7 +459,6 @@ impl Peer {
             if bytes_read > 4 {
               dbg!("oh");
             }
-
 
             if bytes_read == 4 {
               println!("Peer received a message");

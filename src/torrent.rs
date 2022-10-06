@@ -16,7 +16,7 @@ use crate::bytes::{encode_bytes, random_id, sha1_hash};
 use crate::constants;
 use crate::file_manager::FileManagerMessage;
 use crate::metainfo::MetaInfo;
-use crate::peer::{Block, BlockInfo, Peer, PeerMessage};
+use crate::peer::{Block, BlockInfo, Peer, ClientMessage};
 
 pub struct Torrent {
   pub metainfo: MetaInfo,
@@ -225,7 +225,7 @@ impl Torrent {
 
             // choke the old optimistically unchoked peer
             if let Some(old_peer) = peers.iter().find(|x| Some(x.address) == *optimistic_unchoke_peer) {
-              old_peer.send_message(PeerMessage::Choke).await;
+              old_peer.send_message(ClientMessage::Choke).await;
             }
 
             //                                  am_choking, peer_interested
@@ -242,7 +242,7 @@ impl Torrent {
 
             if let Some(new_unchoke) = &new_unchoke {
               // unchoke the new optimistically unchoked peer
-              new_unchoke.send_message(PeerMessage::Unchoke).await;
+              new_unchoke.send_message(ClientMessage::Unchoke).await;
 
               *optimistic_unchoke_peer = Some(new_unchoke.address);
 
@@ -344,7 +344,7 @@ impl Torrent {
     for peer in &mut *peers {
       if peer_map[&peer.address] == 0 {
         // choke bad peers. they will only be unchoked optimistically
-        peer.send_message(PeerMessage::Choke).await;
+        peer.send_message(ClientMessage::Choke).await;
 
         continue;
       }
@@ -363,11 +363,11 @@ impl Torrent {
       if *peer.peer_interested.lock().await {
         // unchoke
         count += 1;
-        peer.send_message(PeerMessage::Unchoke).await;
+        peer.send_message(ClientMessage::Unchoke).await;
       } else {
         // Peers which have a better upload rate (as compared to the downloaders) but aren't interested get unchoked.
         // If they become interested, this algorithm is rerun
-        peer.send_message(PeerMessage::Unchoke).await;
+        peer.send_message(ClientMessage::Unchoke).await;
       }
     }
   }
@@ -424,7 +424,7 @@ impl Torrent {
   pub async fn alert_peers_updated_job_queue(&self) {
     let peers = self.peers.lock().await;
     for peer in &*peers {
-      peer.send_message(PeerMessage::UpdatedJobQueue).await;
+      peer.send_message(ClientMessage::UpdatedJobQueue).await;
     }
   }
 
@@ -485,7 +485,7 @@ impl Torrent {
         // send update to peers
         for peer in &*self.peers.lock().await {
           peer
-            .send_message(PeerMessage::PieceDownloaded(
+            .send_message(ClientMessage::PieceDownloaded(
               downloading_piece_info.unwrap().index,
             ))
             .await;
