@@ -38,7 +38,7 @@ impl PeerMessageReader {
   // therefore, this function should be cancel safe
   async fn next(&mut self, stream: &mut TcpStream) -> Result<PeerMessage> {
     loop {
-      if self.message_buf_len != 0 {
+      if self.message_buf.len() != 0 {
         let bytes_read = stream
           .read(&mut self.message_buf[self.message_buf_len..])
           .await?;
@@ -49,8 +49,12 @@ impl PeerMessageReader {
             .ok_or(anyhow!("Couldn't parse peer message"))?;
 
           self.message_buf_len = 0;
+          self.message_buf = vec![];
+
           return Ok(peer_message);
         }
+
+        continue;
       }
 
       let bytes_read = stream
@@ -59,9 +63,11 @@ impl PeerMessageReader {
       self.length_buf_len += bytes_read;
 
       if self.length_buf_len == 4 {
-        self.length_buf_len = 0;
         self.message_buf_len = 0;
         self.message_buf = vec![0; u32::from_be_bytes(self.length_buf) as usize];
+
+        self.length_buf_len = 0;
+        self.length_buf = [0; 4];
       }
     }
   }
@@ -70,25 +76,185 @@ impl PeerMessageReader {
 enum PeerMessage {
   Choke,
   Unchoke,
-  Intersted,
+  Interested,
   NotInterested,
   Have(u32),
   Bitfield(Vec<bool>),
   Request(BlockInfo),
   Piece(Block),
   Cancel(BlockInfo),
+  // Port(u16), // TODO: DHT tracker
 }
 
 impl PeerMessage {
   fn from_bytes(bytes: &[u8]) -> Option<Self> {
     let id = bytes.get(0)?;
 
-    // TODO: here
-    match id {
-      _ => {}
-    }
+    use PeerMessage::*;
 
-    todo!()
+    match id {
+      0 => Some(Choke),
+      1 => Some(Unchoke),
+      2 => Some(Interested),
+      3 => Some(NotInterested),
+      4 => {
+        let index = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
+        Some(Have(index))
+      }
+      5 => {
+        let bitfield = bytes
+          .get(1..)?
+          .iter()
+          .flat_map(|b| {
+            [
+              b & 0b10000000 > 0,
+              b & 0b01000000 > 0,
+              b & 0b00100000 > 0,
+              b & 0b00010000 > 0,
+              b & 0b00001000 > 0,
+              b & 0b00000100 > 0,
+              b & 0b00000010 > 0,
+              b & 0b00000001 > 0,
+            ]
+          })
+          .collect();
+
+        Some(Bitfield(bitfield))
+      }
+      6 => {
+        let index = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
+        let begin = u32::from_be_bytes(bytes.get(5..9)?.try_into().ok()?);
+        let length = u32::from_be_bytes(bytes.get(9..13)?.try_into().ok()?);
+
+        let block_info = BlockInfo {
+          index,
+          begin,
+          length,
+        };
+
+        Some(Request(block_info))
+      }
+      7 => {
+        let index = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
+        let begin = u32::from_be_bytes(bytes.get(5..9)?.try_into().ok()?);
+        let block_bytes = bytes.get(9..)?.to_vec();
+
+        let block = Block {
+          info: BlockInfo {
+            index,
+            begin,
+            length: block_bytes.len() as u32,
+          },
+          bytes: block_bytes,
+        };
+
+        Some(Piece(block))
+      }
+      8 => {
+        let index = u32::from_be_bytes(bytes.get(1..5)?.try_into().ok()?);
+        let begin = u32::from_be_bytes(bytes.get(5..9)?.try_into().ok()?);
+        let length = u32::from_be_bytes(bytes.get(9..13)?.try_into().ok()?);
+
+        let block_info = BlockInfo {
+          index,
+          begin,
+          length,
+        };
+
+        Some(Cancel(block_info))
+      }
+      _ => None,
+    }
+  }
+
+  fn as_bytes(&self) -> Vec<u8> {
+    use PeerMessage::*;
+
+    let mut msg = vec![];
+
+    match self {
+      Choke => {
+        msg.extend(1_u32.to_be_bytes()); // length
+        msg.push(0_u8); // id
+
+        msg
+      }
+      Unchoke => {
+        msg.extend(1_u32.to_be_bytes()); // length
+        msg.push(1_u8); // id
+
+        msg
+      }
+      Interested => {
+        msg.extend(1_u32.to_be_bytes()); // length
+        msg.push(2_u8); // id
+
+        msg
+      }
+      NotInterested => {
+        msg.extend(1_u32.to_be_bytes()); // length
+        msg.push(3_u8); // id
+
+        msg
+      }
+      Have(piece_index) => {
+        let mut msg = vec![];
+
+        msg.extend(5_u32.to_be_bytes()); // length
+        msg.push(4_u8); // id
+        msg.extend(piece_index.to_be_bytes()); // piece_index
+
+        msg
+      }
+      Bitfield(bitfield) => {
+        let field: Vec<u8> = bitfield
+          .chunks(8)
+          .map(|c| {
+            ((c.get(0).map_or(0, |x| *x as u8)) << 7)
+              + ((c.get(1).map_or(0, |x| *x as u8)) << 6)
+              + ((c.get(2).map_or(0, |x| *x as u8)) << 5)
+              + ((c.get(3).map_or(0, |x| *x as u8)) << 4)
+              + ((c.get(4).map_or(0, |x| *x as u8)) << 3)
+              + ((c.get(5).map_or(0, |x| *x as u8)) << 2)
+              + ((c.get(6).map_or(0, |x| *x as u8)) << 1)
+              + ((c.get(7).map_or(0, |x| *x as u8)) << 0)
+          })
+          .collect();
+
+        msg.extend((1_u32 + field.len() as u32).to_be_bytes()); // length
+        msg.push(5_u8); // id
+        msg.extend(field); // bitfield
+
+        msg
+      }
+      Request(block_info) => {
+        msg.extend(13_u32.to_be_bytes()); // length
+        msg.push(6_u8); // id
+        msg.extend(block_info.index.to_be_bytes()); // index
+        msg.extend(block_info.begin.to_be_bytes()); // begin
+        msg.extend(block_info.length.to_be_bytes()); // length
+
+        msg
+      }
+      Piece(block) => {
+        msg.extend((9_u32 + block.info.length).to_be_bytes()); // length
+        msg.push(7_u8); // id
+        msg.extend(block.info.index.to_be_bytes()); // index
+        msg.extend(block.info.begin.to_be_bytes()); // begin
+        msg.extend(&block.bytes); // block
+
+        msg
+      }
+      Cancel(block_info) => {
+        msg.extend(13_u32.to_be_bytes()); // length
+        msg.push(8_u8); // id
+        msg.extend(block_info.index.to_be_bytes()); // index
+        msg.extend(block_info.begin.to_be_bytes()); // begin
+        msg.extend(block_info.length.to_be_bytes()); // length
+
+        msg
+      }
+    }
   }
 }
 
@@ -210,54 +376,45 @@ impl Peer {
   }
 
   async fn try_update_job_queue(peer: Arc<Peer>, torrent: Arc<Torrent>) {
-    println!("Trying to update job queue");
-
     // TODO: make the queue size dynamic
     let queue_size = 3;
 
-    // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
-    println!(
-      "Requested blocks = {}, peer is choking us = {}, there is no blocks to download = {}",
-      peer.requested_blocks.lock().await.len(),
-      peer.peer_choking.lock().await,
-      torrent.blocks_to_download.lock().await.is_empty()
-    );
-
-    if peer.requested_blocks.lock().await.len() >= queue_size
-      || *peer.peer_choking.lock().await
-      || torrent.blocks_to_download.lock().await.is_empty()
-    {
-      return;
-    }
-
-    println!("Trying to find block to request");
-
+    let mut requested_blocks = peer.requested_blocks.lock().await;
+    let peer_choking = peer.peer_choking.lock().await;
     let piece_availability = peer.piece_availability.lock().await;
     let mut blocks_to_download = torrent.blocks_to_download.lock().await;
 
-    for i in 0..blocks_to_download.len() {
-      if piece_availability[blocks_to_download[i].index as usize] {
-        let block_info = blocks_to_download.remove(i);
-        // send request
-        peer.requested_blocks.lock().await.push(block_info);
+    // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
 
-        peer
-          .send_message(ClientMessage::RequestPiece(block_info))
-          .await;
+    if requested_blocks.len() >= queue_size || *peer_choking || blocks_to_download.is_empty() {
+      return;
+    }
 
-        let peer = peer.clone();
-        let torrent = torrent.clone();
+    while requested_blocks.len() < queue_size && !blocks_to_download.is_empty() {
+      for i in 0..blocks_to_download.len() {
+        if piece_availability[blocks_to_download[i].index as usize] {
+          let block_info = blocks_to_download.remove(i);
+          // send request
+          requested_blocks.push(block_info);
 
-        // after some time check if the block was downloaded
-        Peer::create_request_timeout(peer, torrent, block_info);
-        break;
+          peer
+            .send_message(ClientMessage::RequestPiece(block_info))
+            .await;
+
+          let peer = peer.clone();
+          let torrent = torrent.clone();
+
+          // after some time check if the block was downloaded
+          Peer::create_request_timeout(peer, torrent, block_info);
+          break;
+        }
       }
     }
   }
 
   fn create_request_timeout(peer: Arc<Peer>, torrent: Arc<Torrent>, block_info: BlockInfo) {
     tokio::spawn(async move {
-      tokio::time::sleep(Duration::from_secs(5)).await;
+      tokio::time::sleep(Duration::from_secs(7)).await;
 
       let mut requested_blocks = peer.requested_blocks.lock().await;
 
@@ -356,13 +513,14 @@ impl Peer {
       }
     };
 
+    // TODO: use this to split the tcp stream. then spawn a new task to do the writing
+    // let (mut read, mut write) = stream.into_split();
+
     // send bitfield
     println!("Sending bitfield");
 
     stream
-      .write_all(&Peer::bitfield_message(
-        &torrent.downloaded_pieces.lock().await,
-      ))
+      .write_all(&PeerMessage::Bitfield(torrent.downloaded_pieces.lock().await.clone()).as_bytes())
       .await
       .unwrap();
 
@@ -381,18 +539,21 @@ impl Peer {
           match msg {
             PieceDownloaded(index) => {
               // send HAVE message
-              stream.write_all(&Peer::have_message(index)).await.unwrap();
+              stream.write_all(&PeerMessage::Have(index).as_bytes()).await.unwrap();
 
-              let downloaded_pieces = torrent.downloaded_pieces.lock().await;
-              let peer_pieces = peer.piece_availability.lock().await;
-
-              assert_eq!(downloaded_pieces.len(), peer_pieces.len());
               let mut interested = false;
-              for i in 0..downloaded_pieces.len() {
-                if !downloaded_pieces[i] && peer_pieces[i] {
-                  // peer has a piece that we dont have. therefore we are interested
-                  interested = true;
-                  break;
+
+              {
+                let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+                let peer_pieces = peer.piece_availability.lock().await;
+
+                assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+                for i in 0..downloaded_pieces.len() {
+                  if !downloaded_pieces[i] && peer_pieces[i] {
+                    // peer has a piece that we dont have. therefore we are interested
+                    interested = true;
+                    break;
+                  }
                 }
               }
 
@@ -402,15 +563,15 @@ impl Peer {
                 if interested {
                   println!("Interested in {}", peer.address);
 
-                  stream.write_all(&Peer::interested_message()).await.unwrap();
+                  stream.write_all(&PeerMessage::Interested.as_bytes()).await.unwrap();
                 } else {
                   println!("Not interested in {}", peer.address);
 
-                  stream.write_all(&Peer::not_interested_message()).await.unwrap();
+                  stream.write_all(&PeerMessage::NotInterested.as_bytes()).await.unwrap();
                 }
-              }
 
-              Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
+                Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
+              }
             }
             Choke => {
               // choke if we aren't choking
@@ -420,7 +581,7 @@ impl Peer {
                 *peer.am_choking.lock().await = true;
 
                 // send CHOKE message
-                stream.write_all(&Peer::choke_message()).await.unwrap();
+                stream.write_all(&PeerMessage::Choke.as_bytes()).await.unwrap();
               }
             }
             Unchoke => {
@@ -431,17 +592,11 @@ impl Peer {
                 *peer.am_choking.lock().await = false;
 
                 // send UNCHOKE message
-                stream.write_all(&Peer::unchoke_message()).await.unwrap();
+                stream.write_all(&PeerMessage::Unchoke.as_bytes()).await.unwrap();
               }
             }
             RequestPiece(block_info) => {
-              println!("Requesting block of piece n.{} from {}", block_info.index, peer.address);
-
-              stream.write_all(&Peer::request_message(
-                block_info.index,
-                block_info.begin,
-                block_info.length,
-              )).await.unwrap();
+              stream.write_all(&PeerMessage::Request(block_info).as_bytes()).await.unwrap();
             }
             UpdatedJobQueue => {
               Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
@@ -450,196 +605,160 @@ impl Peer {
         }
 
         Ok(peer_message) = peer_message_reader.next(&mut stream) => {
-          // TODO: here
+          use PeerMessage::*;
+          match peer_message {
+            Choke => {
+              *peer.peer_choking.lock().await = true;
 
-          let mut length_buf = [0_u8; 4];
-
-          if let Ok(bytes_read) = stream.peek(&mut length_buf).await {
-            // TODO: check if this can happen
-            if bytes_read > 4 {
-              dbg!("oh");
+              Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
             }
+            Unchoke => {
+              *peer.peer_choking.lock().await = false;
 
-            if bytes_read == 4 {
-              println!("Peer received a message");
+              Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
+            }
+            Interested => {
+              *peer.peer_interested.lock().await = true;
 
-              // successfully read first part of the message - length
+              torrent.interested_peer().await;
+            }
+            NotInterested => {
+              *peer.peer_interested.lock().await = false;
+            }
+            Have(piece_index) => {
+              *peer
+                .piece_availability
+                .lock()
+                .await
+                .get_mut(piece_index as usize)
+                .expect("TODO") = true;
 
-              let length = u32::from_be_bytes(length_buf);
+              let mut interested = false;
 
-              let mut buf = vec![0_u8; length as usize + 4];
+              {
+                let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+                let peer_pieces = peer.piece_availability.lock().await;
 
-              // TODO: add timeout
-              match stream.read_exact(&mut buf).await {
-                Ok(_) => {
-                  let msg_id: u8 = buf[4];
-
-                  match msg_id {
-                    0 => {
-                      // CHOKE
-                      *peer.peer_choking.lock().await = true;
-
-                      Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
-                    }
-                    1 => {
-                      // UNCHOKE
-                      *peer.peer_choking.lock().await = false;
-
-                      Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
-                    }
-                    2 => {
-                      // INTERESTED
-                      *peer.peer_interested.lock().await = true;
-
-                      // TODO: maybe don't send message
-                      peer
-                        .torrent_sender
-                        .send(TorrentMessage::InterestedPeer(peer.address))
-                        .await
-                        .unwrap();
-                    }
-                    3 => {
-                      // NOT_INTERESTED
-                      *peer.peer_interested.lock().await = false;
-                    }
-                    4 => {
-                      // HAVE
-                      let piece_index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-
-                      *peer
-                        .piece_availability
-                        .lock()
-                        .await
-                        .get_mut(piece_index as usize)
-                        .expect("TODO") = true;
-
-                      // check if we are interested now
-                      let downloaded_pieces = torrent.downloaded_pieces.lock().await;
-                      let peer_pieces = peer.piece_availability.lock().await;
-
-                      assert_eq!(downloaded_pieces.len(), peer_pieces.len());
-                      let mut interested = false;
-                      for i in 0..downloaded_pieces.len() {
-                        if !downloaded_pieces[i] && peer_pieces[i] {
-                          // peer has a piece that we dont have. therefore we are interested
-                          interested = true;
-                          break;
-                        }
-                      }
-
-                      if interested != *peer.am_interested.lock().await {
-                        *peer.am_interested.lock().await = interested;
-
-                        if interested {
-                          // send INTERESTED message
-                          stream.write_all(&Peer::interested_message()).await.unwrap();
-                        } else {
-                          // send NOT_INTERESTED message
-                          stream.write_all(&Peer::not_interested_message()).await.unwrap();
-                        }
-                      }
-                    }
-                    5 => {
-                      // BITFIELD
-
-                      let bitfield: Vec<bool> = buf[5..].iter().flat_map(|b|
-                        [
-                          b & 0b10000000 > 0,
-                          b & 0b01000000 > 0,
-                          b & 0b00100000 > 0,
-                          b & 0b00010000 > 0,
-                          b & 0b00001000 > 0,
-                          b & 0b00000100 > 0,
-                          b & 0b00000010 > 0,
-                          b & 0b00000001 > 0,
-                        ]).collect();
-
-                        let actual_len = torrent.metainfo.pieces.len();
-
-                        if actual_len < peer.piece_availability.lock().await.len() {
-                          // disconnect client
-                          break 'main_loop;
-                        }
-
-                        *peer.piece_availability.lock().await = bitfield[..actual_len].to_vec();
-                    }
-                    6 => {
-                      // REQUEST
-
-                      if *peer.am_choking.lock().await {
-                        // don't upload to choked peers
-                        continue;
-                      }
-
-                      let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-                      let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
-                      let length = u32::from_be_bytes(buf[13..17].try_into().unwrap());
-                      if length > MAX_ALLOWED_BLOCK_SIZE {
-                        // disconnect
-                        break 'main_loop;
-                      }
-
-                      // i don't think it actually means to send it immediately, just when you get it. that's probably why "CANCEL" exists
-                      // TODO: find out how it actually should be
-
-                      let chunk = torrent.read_block(&BlockInfo { index, begin, length }).await;
-
-                      stream.write_all(&Peer::piece_message(index, begin, &chunk)).await.unwrap();
-
-                      // update bytes uploaded
-                      *peer.uploaded_to.lock().await += length;
-                    }
-                    7 => {
-                      // PIECE
-
-                      if *peer.am_choking.lock().await {
-                        continue;
-                      }
-
-                      let index = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-                      let begin = u32::from_be_bytes(buf[9..13].try_into().unwrap());
-                      let block = buf[13..].to_vec();
-
-                      let sent_block = Block {
-                        info: BlockInfo {
-                          index,
-                          begin,
-                          length: block.len() as u32,
-                        },
-                        bytes: block,
-                      };
-
-                      let mut requested_blocks = peer.requested_blocks.lock().await;
-
-                      if let Some(pos) = requested_blocks.iter().position(|data| *data == sent_block.info) {
-                        // only requested pieces are accepted
-                        requested_blocks.remove(pos);
-
-                        // update bytes downloaded
-                        *peer.downloaded_from.lock().await += sent_block.info.length;
-
-                        peer.torrent_sender.send(TorrentMessage::BlockDownloaded(sent_block)).await.unwrap();
-
-                        Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
-                      }
-                    }
-                    8 => {
-                      // CANCEL
-                      // there isn't really a use for this?
-                      // TODO
-                    }
-                    _ => {
-                      // disconnect client
-                      break 'main_loop;
-
-                    }
+                assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+                for i in 0..downloaded_pieces.len() {
+                  if !downloaded_pieces[i] && peer_pieces[i] {
+                    // peer has a piece that we dont have. therefore we are interested
+                    interested = true;
+                    break;
                   }
                 }
-                Err(_) => {
-                  // disconnect client
-                  break 'main_loop;
+              }
+
+              if interested != *peer.am_interested.lock().await {
+                *peer.am_interested.lock().await = interested;
+
+                if interested {
+                  println!("Interested in {}", peer.address);
+
+                  stream.write_all(&PeerMessage::Interested.as_bytes()).await.unwrap();
+                } else {
+                  println!("Not interested in {}", peer.address);
+
+                  stream.write_all(&PeerMessage::NotInterested.as_bytes()).await.unwrap();
+                }
+
+                Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
+              }
+            }
+            Bitfield(bitfield) => {
+              let actual_len = torrent.metainfo.pieces.len();
+
+              if actual_len < peer.piece_availability.lock().await.len() {
+                // disconnect client
+                break 'main_loop;
+              }
+
+              println!("Got bitfield");
+
+              *peer.piece_availability.lock().await = bitfield[..actual_len].to_vec();
+
+              let mut interested = false;
+
+              {
+                let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+                let peer_pieces = peer.piece_availability.lock().await;
+
+                assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+                for i in 0..downloaded_pieces.len() {
+                  if !downloaded_pieces[i] && peer_pieces[i] {
+                    // peer has a piece that we dont have. therefore we are interested
+                    interested = true;
+                    break;
+                  }
                 }
               }
+
+              if interested != *peer.am_interested.lock().await {
+                *peer.am_interested.lock().await = interested;
+
+                if interested {
+                  println!("Interested in {}", peer.address);
+
+                  stream.write_all(&PeerMessage::Interested.as_bytes()).await.unwrap();
+                } else {
+                  println!("Not interested in {}", peer.address);
+
+                  stream.write_all(&PeerMessage::NotInterested.as_bytes()).await.unwrap();
+                }
+
+                Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
+              }
+            }
+            Request(block_info) => {
+              if *peer.am_choking.lock().await {
+                // don't upload to choked peers
+                continue;
+              }
+
+              if block_info.length > MAX_ALLOWED_BLOCK_SIZE {
+                // disconnect
+                break 'main_loop;
+              }
+
+              // i don't think it actually means to send it immediately, just when you get it. that's probably why "CANCEL" exists
+              // TODO: find out how it actually should be
+              // i think the way to do this is to create another thread and upload on it to the peer
+              // while letting this loop do its thing like reading from peer
+              // therefore, maybe there needs to be always another thread for writing (uploading)
+
+              let block_bytes = torrent.read_block(&block_info).await;
+
+              assert_eq!(block_info.length as usize, block_bytes.len());
+
+              let block = Block {
+                info: block_info,
+                bytes: block_bytes,
+              };
+
+              stream.write_all(&PeerMessage::Piece(block).as_bytes()).await.unwrap();
+
+              // update bytes uploaded
+              *peer.uploaded_to.lock().await += block_info.length;
+            }
+            Piece(block) => {
+              let mut requested_blocks = peer.requested_blocks.lock().await;
+
+              if let Some(pos) = requested_blocks.iter().position(|data| *data == block.info) {
+                // only requested pieces are accepted
+                requested_blocks.remove(pos);
+                drop(requested_blocks);
+
+                // update bytes downloaded
+                *peer.downloaded_from.lock().await += block.info.length;
+
+                torrent.block_downloaded(block).await;
+
+
+                Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
+              }
+            }
+            Cancel(block_info) => {
+              // TODO: find out what to do with cancel
             }
           }
         }
@@ -665,8 +784,8 @@ impl Peer {
           *peer.downloaded_from_rate.lock().await = rolling_download.iter().sum::<u32>() / rolling_download.len() as u32;
           *peer.uploaded_to_rate.lock().await = rolling_upload.iter().sum::<u32>() / rolling_upload.len() as u32;
 
-          println!("Download rate: {}", *peer.downloaded_from_rate.lock().await / (1024 * 1024));
-          println!("Upload rate: {}", *peer.uploaded_to_rate.lock().await / (1024 * 1024));
+          println!("Download rate: {} Mb/s", *peer.downloaded_from_rate.lock().await / (1024 * 1024));
+          println!("Upload rate: {} Mb/s", *peer.uploaded_to_rate.lock().await / (1024 * 1024));
 
           downloaded_from_last_second = downloaded_from_now;
           uploaded_to_last_second = uploaded_to_now;
@@ -687,131 +806,6 @@ impl Peer {
     msg.extend(peer_id); // peer_id
 
     assert_eq!(msg.len(), 68);
-
-    msg
-  }
-
-  pub fn choke_message() -> Vec<u8> {
-    println!("Sending choke_message");
-
-    let mut msg = vec![];
-
-    msg.extend(1_u32.to_be_bytes()); // length
-    msg.push(0_u8); // id
-
-    msg
-  }
-
-  pub fn unchoke_message() -> Vec<u8> {
-    println!("Sending unchoke_message");
-
-    let mut msg = vec![];
-
-    msg.extend(1_u32.to_be_bytes()); // length
-    msg.push(1_u8); // id
-
-    msg
-  }
-
-  pub fn interested_message() -> Vec<u8> {
-    println!("Sending interested_message");
-
-    let mut msg = vec![];
-
-    msg.extend(1_u32.to_be_bytes()); // length
-    msg.push(2_u8); // id
-
-    msg
-  }
-
-  pub fn not_interested_message() -> Vec<u8> {
-    println!("Sending not_interested_message");
-
-    let mut msg = vec![];
-
-    msg.extend(1_u32.to_be_bytes()); // length
-    msg.push(3_u8); // id
-
-    msg
-  }
-
-  pub fn have_message(piece_index: u32) -> Vec<u8> {
-    println!("Sending have_message");
-
-    let mut msg = vec![];
-
-    msg.extend(5_u32.to_be_bytes()); // length
-    msg.push(4_u8); // id
-    msg.extend(piece_index.to_be_bytes()); // piece_index
-
-    msg
-  }
-
-  pub fn bitfield_message(bitfield: &[bool]) -> Vec<u8> {
-    println!("Sending bitfield_message");
-
-    let mut msg = vec![];
-
-    let field: Vec<u8> = bitfield
-      .chunks(8)
-      .map(|c| {
-        ((c.get(0).map_or(0, |x| *x as u8)) << 7)
-          + ((c.get(1).map_or(0, |x| *x as u8)) << 6)
-          + ((c.get(2).map_or(0, |x| *x as u8)) << 5)
-          + ((c.get(3).map_or(0, |x| *x as u8)) << 4)
-          + ((c.get(4).map_or(0, |x| *x as u8)) << 3)
-          + ((c.get(5).map_or(0, |x| *x as u8)) << 2)
-          + ((c.get(6).map_or(0, |x| *x as u8)) << 1)
-          + ((c.get(7).map_or(0, |x| *x as u8)) << 0)
-      })
-      .collect();
-
-    msg.extend((1_u32 + field.len() as u32).to_be_bytes()); // length
-    msg.push(5_u8); // id
-    msg.extend(field); // bitfield
-
-    msg
-  }
-
-  pub fn request_message(piece_index: u32, begin: u32, length: u32) -> Vec<u8> {
-    println!("Sending request_message");
-
-    let mut msg = vec![];
-
-    msg.extend(13_u32.to_be_bytes()); // length
-    msg.push(6_u8); // id
-    msg.extend(piece_index.to_be_bytes()); // index
-    msg.extend(begin.to_be_bytes()); // begin
-    msg.extend(length.to_be_bytes()); // length
-
-    msg
-  }
-
-  pub fn piece_message(piece_index: u32, begin: u32, block: &[u8]) -> Vec<u8> {
-    println!("Sending piece_message");
-
-    let mut msg = vec![];
-
-    msg.extend((9_u32 + block.len() as u32).to_be_bytes()); // length
-    msg.push(7_u8); // id
-    msg.extend(piece_index.to_be_bytes()); // index
-    msg.extend(begin.to_be_bytes()); // begin
-    msg.extend(block); // block
-
-    msg
-  }
-
-  // TODO: find out what to do with this
-  pub fn cancel_message(piece_index: u32, begin: u32, length: u32) -> Vec<u8> {
-    println!("Sending cancel_message");
-
-    let mut msg = vec![];
-
-    msg.extend(13_u32.to_be_bytes()); // length
-    msg.push(8_u8); // id
-    msg.extend(piece_index.to_be_bytes()); // index
-    msg.extend(begin.to_be_bytes()); // begin
-    msg.extend(length.to_be_bytes()); // length
 
     msg
   }
