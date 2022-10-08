@@ -280,8 +280,6 @@ pub enum ClientMessage {
   UpdatedJobQueue,
 }
 
-// FIXME: select in a loop is not working correctly. interval branch is not being executed.
-
 pub struct Peer {
   pub address: SocketAddr,
   peer_id: Mutex<Option<[u8; 20]>>, // before handshake it's None
@@ -377,7 +375,7 @@ impl Peer {
 
   async fn try_update_job_queue(peer: Arc<Peer>, torrent: Arc<Torrent>) {
     // TODO: make the queue size dynamic
-    let queue_size = 3;
+    let queue_size = 2;
 
     let mut requested_blocks = peer.requested_blocks.lock().await;
     let peer_choking = peer.peer_choking.lock().await;
@@ -752,7 +750,6 @@ impl Peer {
                 *peer.downloaded_from.lock().await += block.info.length;
 
                 torrent.block_downloaded(block).await;
-
 
                 Peer::try_update_job_queue(peer.clone(), torrent.clone()).await;
               }
