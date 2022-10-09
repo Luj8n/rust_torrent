@@ -2,11 +2,12 @@ use anyhow::{anyhow, Result};
 use bip_bencode::{BDecodeOpt, BRefAccess, BencodeRef};
 use futures::future::join_all;
 use rand::prelude::*;
+use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Weak};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::select;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::{oneshot, Mutex};
@@ -25,6 +26,7 @@ pub struct Torrent {
   files: Vec<FileInfo>, // TODO: later add a feature to choose which files to download
   file_manager_sender: Sender<FileManagerMessage>,
 
+  // TODO: update these stats
   bytes_uploaded: Mutex<u32>,
   bytes_downloaded: Mutex<u32>,
   peers: Mutex<Vec<Arc<Peer>>>, // TODO: probably hashmap better
@@ -210,6 +212,14 @@ impl Torrent {
       loop {
         select! {
           _ = choke_interval.tick() => {
+            {
+              let downloaded_pieces = torrent.downloaded_pieces.lock().await;
+              let progress = 100.0 * downloaded_pieces.iter().filter(|x| **x).count() as f32 / downloaded_pieces.len() as f32;
+
+              println!();
+              println!("--- Progress: {:.1}/100", progress);
+            }
+
             torrent.regular_unchoke().await;
           }
           _ = optimistic_unchoke_interval.tick() => {
@@ -310,22 +320,9 @@ impl Torrent {
 
     // workaround because can't sort with an async function
     let mut peer_map: HashMap<SocketAddr, u32> = HashMap::new();
-    println!("");
-    println!("--------------------------");
-    println!("Currently connected peers:");
     for peer in &*peers {
-      println!(
-        "{}, am_choking={}, am_interested={}, peer_choking={}, peer_interested={}",
-        peer.address,
-        peer.am_choking.lock().await,
-        peer.am_interested.lock().await,
-        peer.peer_choking.lock().await,
-        peer.peer_interested.lock().await,
-      );
       peer_map.insert(peer.address, *peer.downloaded_from_rate.lock().await);
     }
-    println!("--------------------------");
-    println!("");
 
     // peers are rated by their rolling upload average
     // TODO: when seeding (100% downloaded torrent) they should be rated by their download rate
@@ -463,7 +460,9 @@ impl Torrent {
         }
       } else {
         // good piece
-        println!("Downloaded piece {}", downloading_piece_index.unwrap());
+        if downloading_piece_index.unwrap() % 100 == 0 {
+          println!("Downloaded piece {}", downloading_piece_index.unwrap());
+        }
 
         // write it to disk
         self
@@ -708,10 +707,8 @@ impl Torrent {
     event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
-    // let url = format!("{}/?{}&{}{}", self.metainfo.announce);
     let mut builder = reqwest::Client::new()
       .get(&self.metainfo.announce)
-      // .get("https://httpbin.org/anything")
       .query(&[("peer_id", encode_bytes(&self.peer_id))])
       .query(&[("port", self.port)])
       .query(&[
@@ -818,6 +815,134 @@ impl Torrent {
     event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
-    todo!()
+    let sock = UdpSocket::bind("0.0.0.0:0").await?;
+
+    // let re = Regex::new(r"^(udp:.+):(\d+)(.*)$").unwrap();
+    // let captures = re
+    //   .captures(&self.metainfo.announce)
+    //   .ok_or(anyhow!("Invalid announce url"))?;
+    
+    // let mut ip_part = captures.get(1).unwrap().as_str().to_string();
+    // if let Some(ending) = captures.get(3) {
+    //   ip_part += ending.as_str();
+    // }
+    // let port_part = u16::from_str_radix(captures.get(2).unwrap().as_str(), 10).unwrap();
+
+    // FIXME
+    // sock.connect((ip_part, port_part)).await?;
+
+    let transaction_id: u32 = random();
+    let connection_request: Vec<u8> = {
+      let mut buf = vec![];
+
+      let protocol_id: u64 = 0x41727101980;
+      buf.extend(protocol_id.to_be_bytes());
+
+      let action: u32 = 0;
+      buf.extend(action.to_be_bytes());
+
+      buf.extend(transaction_id.to_be_bytes());
+
+      buf
+    };
+
+    // TODO: should retry. same for later calls
+    let bytes_sent = sock.send(&connection_request).await?;
+    assert_eq!(bytes_sent, connection_request.len());
+
+    let mut connect_response: Vec<u8> = vec![0; 16];
+    let bytes_read = sock.recv(&mut connect_response).await?;
+
+    assert!(bytes_read >= connect_response.len());
+    assert_eq!(0, u32::from_be_bytes(connect_response[0..4].try_into()?));
+    assert_eq!(
+      transaction_id,
+      u32::from_be_bytes(connect_response[4..8].try_into()?)
+    );
+    let connection_id = u64::from_be_bytes(connect_response[8..16].try_into()?);
+
+    let transaction_id: u32 = random();
+    let announce_request: Vec<u8> = {
+      let mut buf = vec![];
+
+      buf.extend(connection_id.to_be_bytes());
+
+      let action: u32 = 1;
+      buf.extend(action.to_be_bytes());
+
+      buf.extend(transaction_id.to_be_bytes());
+
+      buf.extend(self.metainfo.info_hash);
+
+      buf.extend(self.peer_id);
+
+      let downloaded: u64 = *self.bytes_downloaded.lock().await as u64;
+      buf.extend(downloaded.to_be_bytes());
+
+      let left: u64 = self.bytes_left().await as u64;
+      buf.extend(left.to_be_bytes());
+
+      let uploaded: u64 = *self.bytes_uploaded.lock().await as u64;
+      buf.extend(uploaded.to_be_bytes());
+
+      let event: u32 = match event {
+        None => 0,
+        Some(TrackerEvent::Completed) => 1,
+        Some(TrackerEvent::Started) => 2,
+        Some(TrackerEvent::Stopped) => 3,
+      };
+      buf.extend(event.to_be_bytes());
+
+      let ip_address: u32 = 0;
+      buf.extend(ip_address.to_be_bytes());
+
+      let key: u32 = random(); // no clue what this is for
+      buf.extend(key.to_be_bytes());
+
+      let num_want: i32 = -1;
+      buf.extend(num_want.to_be_bytes());
+
+      let port: u16 = self.port;
+      buf.extend(port.to_be_bytes());
+
+      buf
+    };
+
+    let bytes_sent = sock.send(&announce_request).await?;
+    assert_eq!(bytes_sent, announce_request.len());
+
+    let mut announce_response: Vec<u8> = vec![0; 20 + 6 * 100];
+    let bytes_read = sock.recv(&mut announce_response).await?;
+
+    assert!(bytes_read >= 20);
+    assert_eq!(
+      transaction_id,
+      u32::from_be_bytes(announce_response[4..8].try_into()?)
+    );
+
+    let interval = u32::from_be_bytes(announce_response[8..12].try_into()?);
+    let leechers = u32::from_be_bytes(announce_response[12..16].try_into()?);
+    let seeders = u32::from_be_bytes(announce_response[16..20].try_into()?);
+
+    let mut peers = vec![];
+
+    let peers_count = (bytes_read - 20) / 6;
+    for i in 0..peers_count {
+      let [a, b, c, d]: [u8; 4] = announce_response[(20 + i * 6)..(20 + i * 6 + 4)].try_into()?;
+      let port =
+        u16::from_be_bytes(announce_response[(20 + i * 6 + 4)..(20 + i * 6 + 6)].try_into()?);
+
+      peers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port));
+    }
+
+    Ok(TrackerResponse {
+      warning_message: None,
+      interval,
+      min_interval: None,
+      tracker_id,
+      complete: leechers,
+      incomplete: seeders,
+      peer_info: peers,
+    })
   }
 }
