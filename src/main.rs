@@ -14,7 +14,7 @@ mod torrent;
 async fn main() {
   println!("Starting...");
 
-  let path = Path::new("torrents/linux_mint.torrent"); // TODO: create some torrent and seed it myself
+  let path = Path::new("torrents/linux_mint.torrent");
 
   let mut manager = TorrentManager::new();
 

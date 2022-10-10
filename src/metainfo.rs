@@ -6,7 +6,7 @@ use crate::bytes::sha1_hash;
 #[derive(Clone, Debug)]
 pub struct MetaInfo {
   pub announce: String,
-  // pub announce_list: Option<Vec<String>>,
+  pub announce_list: Option<Vec<String>>,
   pub creation_date: Option<u32>,
   pub comment: Option<String>,
   pub created_by: Option<String>,
@@ -40,17 +40,17 @@ impl MetaInfo {
       .and_then(|x| x.str().map(|y| y.to_owned()))
       .ok_or_else(|| anyhow!("Announce missing"))?;
 
-    // let announce_list = root_dict
-    //   .lookup(b"announce-list")
-    //   .map(|x| {
-    //     x.list().map(|y| {
-    //       y.into_iter()
-    //         .map(|z| z.str().map(|y| y.to_owned()))
-    //         .collect::<Option<Vec<String>>>()
-    //     })
-    //   })
-    //   .flatten()
-    //   .flatten();
+    let announce_list = root_dict
+      .lookup(b"announce-list")
+      .map(|x| {
+        x.list().map(|y| {
+          y.into_iter()
+            .map(|z| z.str().map(|y| y.to_owned()))
+            .collect::<Option<Vec<String>>>()
+        })
+      })
+      .flatten()
+      .flatten();
 
     let creation_date = root_dict
       .lookup(b"creation date")
@@ -178,6 +178,7 @@ impl MetaInfo {
 
     Ok(MetaInfo {
       announce,
+      announce_list,
       creation_date,
       comment,
       created_by,

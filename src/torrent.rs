@@ -52,6 +52,7 @@ pub struct TrackerResponse {
   peer_info: Vec<SocketAddr>,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum TrackerEvent {
   Started,
   Stopped,
@@ -686,11 +687,32 @@ impl Torrent {
     event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
-    let protocol = self.metainfo.announce.split(':').next();
+    // TODO: check if we have saved tracker url
+
+    let mut possible_urls = vec![&self.metainfo.announce];
+    if let Some(announce_list) = &self.metainfo.announce_list {
+      possible_urls.extend(announce_list.iter());
+    }
+
+    for possible_url in possible_urls {
+      if let Ok(response) = self.try_request_tracker(possible_url, event).await {
+        return Ok(response);
+      }
+    }
+
+    Err(anyhow!("Couldn't request from any tracker"))
+  }
+
+  async fn try_request_tracker(
+    &self,
+    tracker_url: &str,
+    event: Option<TrackerEvent>,
+  ) -> Result<TrackerResponse> {
+    let protocol = tracker_url.split(':').next();
 
     match protocol {
-      Some("https" | "http") => self.request_tracker_http(event, tracker_id).await,
-      Some("udp") => self.request_tracker_udp(event, tracker_id).await,
+      Some("https" | "http") => self.request_tracker_http(tracker_url, event, None).await,
+      Some("udp") => self.request_tracker_udp(tracker_url, event, None).await,
       Some(_) => Err(anyhow!(
         "Tracker protocol not supported: {}",
         protocol.unwrap()
@@ -704,11 +726,12 @@ impl Torrent {
 
   async fn request_tracker_http(
     &self,
+    tracker_url: &str,
     event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
     let mut builder = reqwest::Client::new()
-      .get(&self.metainfo.announce)
+      .get(tracker_url)
       .query(&[("peer_id", encode_bytes(&self.peer_id))])
       .query(&[("port", self.port)])
       .query(&[
@@ -812,24 +835,21 @@ impl Torrent {
 
   async fn request_tracker_udp(
     &self,
+    tracker_url: &str,
     event: Option<TrackerEvent>,
     tracker_id: Option<String>,
   ) -> Result<TrackerResponse> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
 
-    // let re = Regex::new(r"^(udp:.+):(\d+)(.*)$").unwrap();
-    // let captures = re
-    //   .captures(&self.metainfo.announce)
-    //   .ok_or(anyhow!("Invalid announce url"))?;
-    
-    // let mut ip_part = captures.get(1).unwrap().as_str().to_string();
-    // if let Some(ending) = captures.get(3) {
-    //   ip_part += ending.as_str();
-    // }
-    // let port_part = u16::from_str_radix(captures.get(2).unwrap().as_str(), 10).unwrap();
+    let re = Regex::new(r"^udp://(.+):(\d+).*$").unwrap();
+    let captures = re
+      .captures(tracker_url)
+      .ok_or(anyhow!("Invalid announce url"))?;
 
-    // FIXME
-    // sock.connect((ip_part, port_part)).await?;
+    let ip_part = captures.get(1).unwrap().as_str().to_string();
+    let port_part = u16::from_str_radix(captures.get(2).unwrap().as_str(), 10).unwrap();
+
+    sock.connect((ip_part, port_part)).await?;
 
     let transaction_id: u32 = random();
     let connection_request: Vec<u8> = {
