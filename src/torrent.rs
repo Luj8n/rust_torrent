@@ -308,7 +308,7 @@ impl Torrent {
     self.peers.lock().await.retain(|x| x.address != address);
 
     // run regular unchoke algorithm
-    self.regular_unchoke().await;
+    // self.regular_unchoke().await;
 
     // TODO: maybe reset regular unchoke timer
     // choke_interval.reset();
