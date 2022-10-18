@@ -8,13 +8,17 @@ mod file_manager;
 mod manager;
 mod metainfo;
 mod peer;
+mod peer_info;
 mod torrent;
 
 #[tokio::main]
 async fn main() {
+  // FIXME: find the deadlock. trying to trace but it doesn't work for some reason
+  console_subscriber::init();
+
   println!("Starting...");
 
-  let path = Path::new("torrents/linux_mint.torrent");
+  let path = Path::new("torrents/testing.torrent");
 
   let mut manager = TorrentManager::new();
 

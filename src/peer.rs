@@ -20,6 +20,7 @@ use tokio::{
 
 use crate::{
   constants::{BLOCK_SIZE, MAX_ALLOWED_BLOCK_SIZE, ROLLING_AVERAGE_SIZE, TIMEOUT_DURATION},
+  peer_info::PeerInfo,
   torrent::{Torrent, TorrentMessage},
 };
 
@@ -286,37 +287,8 @@ pub enum ClientMessage {
   UpdatedJobQueue,
 }
 
-pub struct Peer {
-  pub address: SocketAddr,
-  peer_id: Mutex<Option<[u8; 20]>>, // before handshake it's None
-
-  pub am_choking: Mutex<bool>,
-  pub am_interested: Mutex<bool>,
-  pub peer_choking: Mutex<bool>,
-  pub peer_interested: Mutex<bool>,
-
-  downloaded_from: Mutex<u32>, // total downloaded bytes
-  uploaded_to: Mutex<u32>,     // total uploaded bytes
-
-  rolling_download: Mutex<Vec<u32>>,
-  rolling_upload: Mutex<Vec<u32>>,
-
-  pub downloaded_from_rate: Mutex<u32>, // rolling average, updated every second
-  pub uploaded_to_rate: Mutex<u32>,     // rolling average, updated every second
-
-  queue_size: Mutex<usize>,
-
-  pub piece_availability: Mutex<Vec<bool>>,
-  requested_blocks: Mutex<Vec<BlockInfo>>,
-
-  torrent: Weak<Torrent>,
-  torrent_sender: Sender<TorrentMessage>,
-  peer_sender: Mutex<Option<Sender<ClientMessage>>>,
-  peer: Weak<Peer>,
-}
-
 #[derive(Debug)]
-enum PeerWriterMessage {
+pub enum PeerWriterMessage {
   SendChoke,
   SendUnchoke,
   SendInterested,
@@ -328,6 +300,16 @@ enum PeerWriterMessage {
   SendCancel(BlockInfo),
 }
 
+pub struct Peer {
+  pub address: SocketAddr,
+  pub peer_info: Mutex<PeerInfo>,
+
+  torrent: Weak<Torrent>,
+  torrent_sender: Sender<TorrentMessage>,
+  peer_sender: Mutex<Option<Sender<ClientMessage>>>,
+  peer: Weak<Peer>,
+}
+
 impl Peer {
   pub fn new(
     address: SocketAddr,
@@ -336,29 +318,7 @@ impl Peer {
   ) -> Arc<Self> {
     Arc::new_cyclic(|me| Peer {
       address,
-      peer_id: Mutex::new(None),
-
-      am_choking: Mutex::new(true),
-      am_interested: Mutex::new(false),
-      peer_choking: Mutex::new(true),
-      peer_interested: Mutex::new(false),
-
-      downloaded_from: Mutex::new(0),
-      uploaded_to: Mutex::new(0),
-
-      rolling_download: Mutex::new(vec![0]),
-      rolling_upload: Mutex::new(vec![0]),
-
-      downloaded_from_rate: Mutex::new(0),
-      uploaded_to_rate: Mutex::new(0),
-
-      queue_size: Mutex::new(1),
-
-      piece_availability: Mutex::new(vec![
-        false;
-        torrent.clone().upgrade().unwrap().metainfo.pieces.len()
-      ]),
-      requested_blocks: Mutex::new(vec![]),
+      peer_info: Mutex::new(PeerInfo::new(&torrent.clone().upgrade().unwrap().metainfo)),
 
       torrent,
       torrent_sender,
@@ -368,6 +328,7 @@ impl Peer {
   }
 
   pub async fn send_message(&self, peer_message: ClientMessage) {
+    // println!("Peer sender");
     if let Some(sender) = &*self.peer_sender.lock().await {
       match sender.send(peer_message).await {
         Ok(_) => {}
@@ -408,35 +369,19 @@ impl Peer {
     torrent: Arc<Torrent>,
     peer_writer_sender: &Sender<PeerWriterMessage>,
   ) -> Result<()> {
-    let queue_size = peer.queue_size.lock().await;
-    let mut requested_blocks = peer.requested_blocks.lock().await;
-    let peer_choking = peer.peer_choking.lock().await;
-    let piece_availability = peer.piece_availability.lock().await;
-    let mut blocks_to_download = torrent.blocks_to_download.lock().await;
+    let mut peer_info = peer.peer_info.lock().await;
 
-    // don't request new blocks if job queue is full, we are being choked or there are no blocks to download
-    if requested_blocks.len() >= *queue_size || *peer_choking || blocks_to_download.is_empty() {
-      return Ok(());
-    }
+    if let Some(gotten_jobs) =
+      peer_info.try_get_new_jobs(&mut *torrent.blocks_to_download.lock().await)
+    {
+      for job in gotten_jobs {
+        peer_writer_sender
+          .send(PeerWriterMessage::SendRequest(job))
+          .await?;
 
-    while requested_blocks.len() < *queue_size && !blocks_to_download.is_empty() {
-      for i in 0..blocks_to_download.len() {
-        if piece_availability[blocks_to_download[i].index as usize] {
-          let block_info = blocks_to_download.remove(i);
-          // send request
-          requested_blocks.push(block_info);
-
-          peer_writer_sender
-            .send(PeerWriterMessage::SendRequest(block_info))
-            .await?;
-
-          let peer = peer.clone();
-          let torrent = torrent.clone();
-
-          // after some time check if the block was downloaded
-          Peer::create_request_timeout(peer, torrent, block_info);
-          break;
-        }
+        // after some time check if the block was downloaded
+        Peer::create_request_timeout(peer.clone(), torrent.clone(), job);
+        break;
       }
     }
 
@@ -447,13 +392,10 @@ impl Peer {
     tokio::spawn(async move {
       tokio::time::sleep(Duration::from_secs(7)).await;
 
-      let mut requested_blocks = peer.requested_blocks.lock().await;
+      let mut peer_info = peer.peer_info.lock().await;
+      let mut blocks_to_download = torrent.blocks_to_download.lock().await;
 
-      if let Some(pos) = requested_blocks.iter().position(|x| *x == block_info) {
-        requested_blocks.remove(pos);
-
-        torrent.blocks_to_download.lock().await.push(block_info);
-
+      if peer_info.try_remove_job(block_info, &mut *blocks_to_download) {
         torrent.alert_peers_updated_job_queue().await;
       }
     });
@@ -485,7 +427,9 @@ impl Peer {
       return Err(anyhow!("Bad handshake"));
     }
 
-    *self.peer_id.lock().await = Some(peer_id.try_into()?);
+    let mut peer_info = self.peer_info.lock().await;
+
+    peer_info.add_peer_id(peer_id.try_into()?);
 
     Ok(())
   }
@@ -614,20 +558,12 @@ impl Peer {
     torrent: Arc<Torrent>,
     peer_writer_sender: &Sender<PeerWriterMessage>,
   ) -> Result<()> {
-    let interested = {
-      let downloaded_pieces = torrent.downloaded_pieces.lock().await;
-      let peer_pieces = peer.piece_availability.lock().await;
+    let mut peer_info = peer.peer_info.lock().await;
 
-      assert_eq!(downloaded_pieces.len(), peer_pieces.len());
+    let interested = peer_info.check_if_interested(&torrent.downloaded_pieces.lock().await);
 
-      downloaded_pieces
-        .iter()
-        .zip(peer_pieces.iter())
-        .any(|(our, peers)| *our && *peers)
-    };
-
-    if interested != *peer.am_interested.lock().await {
-      *peer.am_interested.lock().await = interested;
+    if interested != peer_info.am_interested {
+      peer_info.am_interested = interested;
 
       if interested {
         println!("Interested in {}", peer.address);
@@ -643,6 +579,8 @@ impl Peer {
           .await?;
       }
 
+      drop(peer_info);
+
       Peer::try_update_job_queue(peer, torrent, peer_writer_sender).await?;
     }
 
@@ -654,7 +592,7 @@ impl Peer {
       .peer
       .upgrade()
       .ok_or(anyhow!("Couldn't upgrade peer"))?;
-
+    
     let torrent = peer
       .torrent
       .upgrade()
@@ -675,11 +613,6 @@ impl Peer {
 
     let mut one_sec_interval = time::interval(Duration::from_millis(1000));
 
-    let mut downloaded_from_last_second = 0;
-    let mut uploaded_to_last_second = 0;
-
-    let mut in_slow_start = true;
-
     let mut peer_message_reader = PeerMessageReader::new();
 
     'main_loop: loop {
@@ -694,22 +627,26 @@ impl Peer {
               Peer::check_if_interested(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
             Choke => {
+              let mut peer_info = peer.peer_info.lock().await;
+
               // choke if we aren't choking
-              if !*peer.am_choking.lock().await {
+              if !peer_info.am_choking {
                 println!("Choking {}", peer.address);
 
-                *peer.am_choking.lock().await = true;
+                peer_info.am_choking = true;
 
                 // send CHOKE message
                 peer_writer_sender.send(PeerWriterMessage::SendChoke).await?;
               }
             }
             Unchoke => {
+              let mut peer_info = peer.peer_info.lock().await;
+
               // unchoke if we are choking
-              if *peer.am_choking.lock().await {
+              if peer_info.am_choking {
                 println!("Unchoking {}", peer.address);
 
-                *peer.am_choking.lock().await = false;
+                peer_info.am_choking = false;
 
                 // send UNCHOKE message
                 peer_writer_sender.send(PeerWriterMessage::SendUnchoke).await?;
@@ -722,31 +659,31 @@ impl Peer {
         }
 
         Ok(peer_message) = peer_message_reader.next(&mut read_stream) => {
+          let mut peer_info = peer.peer_info.lock().await;
+
           use PeerMessage::*;
           match peer_message {
             Choke => {
-              *peer.peer_choking.lock().await = true;
+              peer_info.peer_choking = true;
 
               Peer::try_update_job_queue(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
             Unchoke => {
-              *peer.peer_choking.lock().await = false;
+              peer_info.peer_choking = false;
 
               Peer::try_update_job_queue(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
             Interested => {
-              *peer.peer_interested.lock().await = true;
+              peer_info.peer_interested = true;
 
               torrent.interested_peer().await;
             }
             NotInterested => {
-              *peer.peer_interested.lock().await = false;
+              peer_info.peer_interested = false;
             }
             Have(piece_index) => {
-              *peer
+              *peer_info
                 .piece_availability
-                .lock()
-                .await
                 .get_mut(piece_index as usize)
                 .ok_or(anyhow!("Bad piece_index"))? = true;
 
@@ -755,19 +692,19 @@ impl Peer {
             Bitfield(bitfield) => {
               let actual_len = torrent.metainfo.pieces.len();
 
-              if actual_len < peer.piece_availability.lock().await.len() {
+              if actual_len < peer_info.piece_availability.len() {
                 // disconnect client
                 break 'main_loop;
               }
 
               println!("Got bitfield");
 
-              *peer.piece_availability.lock().await = bitfield[..actual_len].to_vec();
+              peer_info.piece_availability = bitfield[..actual_len].to_vec();
 
               Peer::check_if_interested(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
             Request(block_info) => {
-              if *peer.am_choking.lock().await {
+              if peer_info.am_choking {
                 // don't upload to choked peers
                 continue;
               }
@@ -780,39 +717,17 @@ impl Peer {
               peer_writer_sender.send(PeerWriterMessage::SendBlock(block_info)).await?;
 
               // update bytes uploaded
-              *peer.uploaded_to.lock().await += block_info.length;
+              peer_info.downloaded_chunk(block_info.length);
             }
             Piece(block) => {
-              let mut requested_blocks = peer.requested_blocks.lock().await;
-
-              if let Some(pos) = requested_blocks.iter().position(|data| *data == block.info) {
+              if let Some(pos) = peer_info.requested_blocks.iter().position(|data| *data == block.info) {
                 // only requested pieces are accepted
-                requested_blocks.remove(pos);
-                drop(requested_blocks);
+                peer_info.requested_blocks.remove(pos);
 
                 // update bytes downloaded
-                *peer.downloaded_from.lock().await += block.info.length;
+                peer_info.uploaded_chunk(block.info.length);
 
                 torrent.block_downloaded(block).await;
-
-                if in_slow_start {
-                  // check if the downloaded bytes in the last second is worse than the rolling average
-                  let last_download_delta = peer.rolling_download.lock().await[0];
-                  let average_download = *peer.downloaded_from_rate.lock().await;
-
-                  let mut queue_size = self.queue_size.lock().await;
-                  if last_download_delta + 10000 < average_download {
-                    println!("Stopping slow start");
-
-                    in_slow_start = false;
-
-                    if *queue_size > 1 {
-                      *queue_size -= 1;
-                    }
-                  } else {
-                    *queue_size += 1;
-                  }
-                }
 
                 Peer::try_update_job_queue(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
               }
@@ -825,48 +740,9 @@ impl Peer {
 
         // update stats every second
         _ = one_sec_interval.tick() => {
-          // calculate rolling peer download/upload speed averages
-          let downloaded_from_now = *peer.downloaded_from.lock().await;
-          let uploaded_to_now = *peer.uploaded_to.lock().await;
+          let mut peer_info = peer.peer_info.lock().await;
 
-          let download_delta = downloaded_from_now - downloaded_from_last_second;
-          let upload_delta = uploaded_to_now - uploaded_to_last_second;
-
-          let mut rolling_download = peer.rolling_download.lock().await;
-          let mut rolling_upload = peer.rolling_upload.lock().await;
-
-          rolling_download.insert(0, download_delta);
-          rolling_upload.insert(0, upload_delta);
-
-          rolling_download.truncate(ROLLING_AVERAGE_SIZE as usize);
-          rolling_upload.truncate(ROLLING_AVERAGE_SIZE as usize);
-
-          let downloaded_from_rate = rolling_download.iter().sum::<u32>() / rolling_download.len() as u32;
-          let uploaded_to_rate = rolling_upload.iter().sum::<u32>() / rolling_upload.len() as u32;
-
-          *peer.downloaded_from_rate.lock().await = downloaded_from_rate;
-          *peer.uploaded_to_rate.lock().await = uploaded_to_rate;
-
-          // don't change the queue size if we are choked (= not downloading) or if we are in slow start
-          if !*peer.peer_choking.lock().await && !in_slow_start {
-            let new_queue_size = (downloaded_from_rate / BLOCK_SIZE).max(1) as usize;
-
-            *peer.queue_size.lock().await = new_queue_size;
-
-          }
-
-          if !*peer.peer_choking.lock().await || !*peer.am_choking.lock().await {
-            println!();
-            println!("----------------------------");
-            println!("Peer address: {}", peer.address);
-            println!("Download rate: {} Mb/s", downloaded_from_rate / (1024 * 1024));
-            println!("Upload rate: {} Mb/s", uploaded_to_rate / (1024 * 1024));
-            println!("Queue size: {}", *peer.queue_size.lock().await);
-            println!("----------------------------");
-          }
-
-          downloaded_from_last_second = downloaded_from_now;
-          uploaded_to_last_second = uploaded_to_now;
+          peer_info.tick();
         }
       };
     }

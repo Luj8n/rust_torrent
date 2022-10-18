@@ -180,8 +180,6 @@ impl Torrent {
       let listener = TcpListener::bind(format!("127.0.0.1:{}", torrent.port))
         .await
         .expect("Couldn't bind"); // TODO: remove .expect;
-      let mut choke_interval = time::interval(Duration::from_secs(10));
-      let mut optimistic_unchoke_interval = time::interval(Duration::from_secs(30));
 
       println!("Contacting the tracker");
       let first_tracker_response = torrent
@@ -209,6 +207,11 @@ impl Torrent {
       torrent.choose_first_piece().await;
 
       torrent.alert_peers_updated_job_queue().await;
+
+      let mut choke_interval = time::interval(Duration::from_secs(10));
+      let mut optimistic_unchoke_interval = time::interval(Duration::from_secs(30));
+      let mut tracker_interval =
+        time::interval(Duration::from_secs(first_tracker_response.interval as u64));
 
       loop {
         select! {
@@ -239,7 +242,8 @@ impl Torrent {
             //                                  am_choking, peer_interested
             let mut peer_map: HashMap<SocketAddr, (bool, bool)> = HashMap::new();
             for peer in &*peers {
-              peer_map.insert(peer.address, (*peer.am_choking.lock().await, *peer.peer_interested.lock().await));
+              let peer_info = peer.peer_info.lock().await;
+              peer_map.insert(peer.address, (peer_info.am_choking, peer_info.peer_interested));
             }
 
             // for some reason it has to be a seperate variable
@@ -276,7 +280,10 @@ impl Torrent {
 
             }
           }
-          // TODO: add a timer for the tracker
+          _ = tracker_interval.tick() => {
+            // TODO: add a timer for the tracker
+
+          }
         };
       }
     });
@@ -289,7 +296,7 @@ impl Torrent {
     // If they become interested, the regular unchoke algorithm is run
 
     // run regular unchoke algorithm
-    self.regular_unchoke().await;
+    // self.regular_unchoke().await;
     // TODO: maybe reset regular unchoke timer
     // choke_interval.reset();
   }
@@ -321,9 +328,20 @@ impl Torrent {
 
     // workaround because can't sort with an async function
     let mut peer_map: HashMap<SocketAddr, u32> = HashMap::new();
+
     for peer in &*peers {
-      peer_map.insert(peer.address, *peer.downloaded_from_rate.lock().await);
+      let peer_info = peer.peer_info.lock().await;
+
+      let speed = peer_info.download_rate();
+      if speed != 0 {
+        print!(
+          "{}, {}, {} | ",
+          speed, peer_info.am_interested, peer_info.peer_choking
+        );
+      }
+      peer_map.insert(peer.address, speed);
     }
+    println!();
 
     // peers are rated by their rolling upload average
     // TODO: when seeding (100% downloaded torrent) they should be rated by their download rate
@@ -340,18 +358,18 @@ impl Torrent {
         }
       }
 
-      if peer_map[&peer.address] == 0 {
-        // choke bad peers. they will only be unchoked optimistically
-        peer.send_message(ClientMessage::Choke).await;
+      // if peer_map[&peer.address] == 0 {
+      //   // choke bad peers. they will only be unchoked optimistically
+      //   peer.send_message(ClientMessage::Choke).await;
 
-        continue;
-      }
+      //   continue;
+      // }
 
       if count >= constants::MAX_DOWNLOADERS {
         break;
       }
 
-      if *peer.peer_interested.lock().await {
+      if peer.peer_info.lock().await.peer_interested {
         // unchoke
         count += 1;
         peer.send_message(ClientMessage::Unchoke).await;
