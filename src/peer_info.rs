@@ -43,7 +43,7 @@ impl PeerInfo {
       prev_total_uploaded_to: 0,
       rolling_download: vec![0],
       rolling_upload: vec![0],
-      queue_size: 1,
+      queue_size: 2,
       piece_availability: vec![false; metainfo.pieces.len()],
       requested_blocks: vec![],
       in_slow_start: true,
@@ -51,11 +51,15 @@ impl PeerInfo {
   }
   // should run every second
   pub fn tick(&mut self) {
-    println!("Tick");
-
     self.update_speed_averages();
     self.update_queue_size();
     self.try_exit_slow_start();
+
+    // println!(
+    //   "Queue size = {}, Download rate = {}Mb/s",
+    //   self.queue_size,
+    //   self.download_rate() / 1024 / 1024
+    // );
   }
 
   pub fn add_peer_id(&mut self, peer_id: [u8; 20]) {
@@ -101,6 +105,8 @@ impl PeerInfo {
           let block_info = available_jobs.remove(i);
           self.requested_blocks.push(block_info);
           just_requested.push(block_info);
+
+          break;
         }
       }
     }

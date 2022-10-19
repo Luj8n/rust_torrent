@@ -368,10 +368,11 @@ impl Peer {
     torrent: Arc<Torrent>,
     peer_writer_sender: &Sender<PeerWriterMessage>,
   ) -> Result<()> {
-    let mut peer_info = peer.peer_info.lock().await;
-
-    if let Some(gotten_jobs) =
-      peer_info.try_get_new_jobs(&mut *torrent.blocks_to_download.lock().await)
+    if let Some(gotten_jobs) = peer
+      .peer_info
+      .lock()
+      .await
+      .try_get_new_jobs(&mut *torrent.blocks_to_download.lock().await)
     {
       for job in gotten_jobs {
         peer_writer_sender
@@ -380,7 +381,6 @@ impl Peer {
 
         // after some time check if the block was downloaded
         Peer::create_request_timeout(peer.clone(), torrent.clone(), job);
-        break;
       }
     }
 
@@ -391,7 +391,13 @@ impl Peer {
     tokio::spawn(async move {
       tokio::time::sleep(Duration::from_secs(7)).await;
 
-      if peer.peer_info.lock().await.try_remove_job(block_info, &mut *torrent.blocks_to_download.lock().await) {
+      if peer
+        .peer_info
+        .lock()
+        .await
+        .try_remove_job(block_info, &mut *torrent.blocks_to_download.lock().await)
+      {
+        println!("Block request timed out");
         torrent.alert_peers_updated_job_queue().await;
       }
     });
@@ -586,7 +592,7 @@ impl Peer {
       .peer
       .upgrade()
       .ok_or(anyhow!("Couldn't upgrade peer"))?;
-    
+
     let torrent = peer
       .torrent
       .upgrade()
@@ -721,7 +727,7 @@ impl Peer {
               peer_writer_sender.send(PeerWriterMessage::SendBlock(block_info)).await?;
 
               // update bytes uploaded
-              peer_info.downloaded_chunk(block_info.length);
+              peer_info.uploaded_chunk(block_info.length);
             }
             Piece(block) => {
               if let Some(pos) = peer_info.requested_blocks.iter().position(|data| *data == block.info) {
@@ -729,7 +735,7 @@ impl Peer {
                 peer_info.requested_blocks.remove(pos);
 
                 // update bytes downloaded
-                peer_info.uploaded_chunk(block.info.length);
+                peer_info.downloaded_chunk(block.info.length);
 
                 torrent.block_downloaded(block).await;
 

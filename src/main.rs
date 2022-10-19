@@ -13,9 +13,6 @@ mod torrent;
 
 #[tokio::main]
 async fn main() {
-  // FIXME: find the deadlock. trying to trace but it doesn't work for some reason
-  console_subscriber::init();
-
   println!("Starting...");
 
   let path = Path::new("torrents/testing.torrent");
