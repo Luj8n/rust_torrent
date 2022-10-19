@@ -328,7 +328,6 @@ impl Peer {
   }
 
   pub async fn send_message(&self, peer_message: ClientMessage) {
-    // println!("Peer sender");
     if let Some(sender) = &*self.peer_sender.lock().await {
       match sender.send(peer_message).await {
         Ok(_) => {}
@@ -392,10 +391,7 @@ impl Peer {
     tokio::spawn(async move {
       tokio::time::sleep(Duration::from_secs(7)).await;
 
-      let mut peer_info = peer.peer_info.lock().await;
-      let mut blocks_to_download = torrent.blocks_to_download.lock().await;
-
-      if peer_info.try_remove_job(block_info, &mut *blocks_to_download) {
+      if peer.peer_info.lock().await.try_remove_job(block_info, &mut *torrent.blocks_to_download.lock().await) {
         torrent.alert_peers_updated_job_queue().await;
       }
     });
@@ -427,9 +423,7 @@ impl Peer {
       return Err(anyhow!("Bad handshake"));
     }
 
-    let mut peer_info = self.peer_info.lock().await;
-
-    peer_info.add_peer_id(peer_id.try_into()?);
+    self.peer_info.lock().await.add_peer_id(peer_id.try_into()?);
 
     Ok(())
   }
@@ -565,6 +559,8 @@ impl Peer {
     if interested != peer_info.am_interested {
       peer_info.am_interested = interested;
 
+      drop(peer_info);
+
       if interested {
         println!("Interested in {}", peer.address);
 
@@ -578,8 +574,6 @@ impl Peer {
           .send(PeerWriterMessage::SendNotInterested)
           .await?;
       }
-
-      drop(peer_info);
 
       Peer::try_update_job_queue(peer, torrent, peer_writer_sender).await?;
     }
@@ -666,15 +660,21 @@ impl Peer {
             Choke => {
               peer_info.peer_choking = true;
 
+              drop(peer_info);
+
               Peer::try_update_job_queue(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
             Unchoke => {
               peer_info.peer_choking = false;
 
+              drop(peer_info);
+
               Peer::try_update_job_queue(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
             Interested => {
               peer_info.peer_interested = true;
+
+              drop(peer_info);
 
               torrent.interested_peer().await;
             }
@@ -686,6 +686,8 @@ impl Peer {
                 .piece_availability
                 .get_mut(piece_index as usize)
                 .ok_or(anyhow!("Bad piece_index"))? = true;
+
+              drop(peer_info);
 
               Peer::check_if_interested(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
@@ -700,6 +702,8 @@ impl Peer {
               println!("Got bitfield");
 
               peer_info.piece_availability = bitfield[..actual_len].to_vec();
+
+              drop(peer_info);
 
               Peer::check_if_interested(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
             }
@@ -729,6 +733,8 @@ impl Peer {
 
                 torrent.block_downloaded(block).await;
 
+                drop(peer_info);
+
                 Peer::try_update_job_queue(peer.clone(), torrent.clone(), &peer_writer_sender).await?;
               }
             }
@@ -740,9 +746,7 @@ impl Peer {
 
         // update stats every second
         _ = one_sec_interval.tick() => {
-          let mut peer_info = peer.peer_info.lock().await;
-
-          peer_info.tick();
+          peer.peer_info.lock().await.tick();
         }
       };
     }
